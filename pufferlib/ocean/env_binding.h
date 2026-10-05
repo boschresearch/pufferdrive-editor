@@ -1,3 +1,11 @@
+// Copyright (c) 2026 Robert Bosch GmbH
+// SPDX-License-Identifier: AGPL-3.0
+
+// This source code is derived from PufferDrive V2.0
+// (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+// Copyright (c) PufferDrive authors, licensed under the MIT license,
+// cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 #include "env_config.h"
 #include <Python.h>
 #include <numpy/arrayobject.h>
@@ -198,34 +206,13 @@ static PyObject *env_step(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
-// Python function to render the environment
+// Python function to step the environment
 static PyObject *env_render(PyObject *self, PyObject *args) {
-    int num_args = PyTuple_Size(args);
-    if (num_args != 3) {
-        PyErr_SetString(PyExc_TypeError, "env_render requires 3 arguments (env_handle, view_mode, draw_traces)");
-        return NULL;
-    }
-
     Env *env = unpack_env(args);
     if (!env) {
         return NULL;
     }
-
-    PyObject *view_mode_arg = PyTuple_GetItem(args, 1);
-    if (!PyObject_TypeCheck(view_mode_arg, &PyLong_Type)) {
-        PyErr_SetString(PyExc_TypeError, "view_mode must be an integer");
-        return NULL;
-    }
-    int view_mode = PyLong_AsLong(view_mode_arg);
-
-    PyObject *show_traces_arg = PyTuple_GetItem(args, 2);
-    if (!PyObject_TypeCheck(show_traces_arg, &PyBool_Type)) {
-        PyErr_SetString(PyExc_TypeError, "draw_traces must be a boolean");
-        return NULL;
-    }
-    bool draw_traces = PyObject_IsTrue(show_traces_arg);
-
-    c_render(env, view_mode, draw_traces);
+    c_render(env);
     Py_RETURN_NONE;
 }
 
@@ -433,7 +420,7 @@ static PyObject *vec_init(PyObject *self, PyObject *args, PyObject *kwargs) {
         env->actions = (void *)((char *)PyArray_DATA(actions) + i * PyArray_STRIDE(actions, 0));
         env->rewards = (void *)((char *)PyArray_DATA(rewards) + i * PyArray_STRIDE(rewards, 0));
         env->terminals = (void *)((char *)PyArray_DATA(terminals) + i * PyArray_STRIDE(terminals, 0));
-        env->truncations = (void *)((char *)PyArray_DATA(truncations) + i * PyArray_STRIDE(truncations, 0));
+        env->truncations = (void*)((char*)PyArray_DATA(truncations) + i*PyArray_STRIDE(truncations, 0));
 
         // Assumes each process has the same number of environments
         int env_seed = i + seed * vec->num_envs;
@@ -540,8 +527,8 @@ static PyObject *vec_step(PyObject *self, PyObject *arg) {
 
 static PyObject *vec_render(PyObject *self, PyObject *args) {
     int num_args = PyTuple_Size(args);
-    if (num_args != 4) {
-        PyErr_SetString(PyExc_TypeError, "vec_render requires 4 arguments");
+    if (num_args != 2) {
+        PyErr_SetString(PyExc_TypeError, "vec_render requires 2 arguments");
         return NULL;
     }
 
@@ -551,23 +538,14 @@ static PyObject *vec_render(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (!PyObject_TypeCheck(PyTuple_GetItem(args, 1), &PyLong_Type)) {
-        PyErr_SetString(PyExc_TypeError, "view_mode must be an integer");
-        return NULL;
-    }
-    if (!PyObject_TypeCheck(PyTuple_GetItem(args, 2), &PyBool_Type)) {
-        PyErr_SetString(PyExc_TypeError, "draw_traces must be a boolean");
-        return NULL;
-    }
-    if (!PyObject_TypeCheck(PyTuple_GetItem(args, 3), &PyLong_Type)) {
+    PyObject *env_id_arg = PyTuple_GetItem(args, 1);
+    if (!PyObject_TypeCheck(env_id_arg, &PyLong_Type)) {
         PyErr_SetString(PyExc_TypeError, "env_id must be an integer");
         return NULL;
     }
-    int view_mode = PyLong_AsLong(PyTuple_GetItem(args, 1));
-    bool draw_traces = PyObject_IsTrue(PyTuple_GetItem(args, 2));
-    int env_id = PyLong_AsLong(PyTuple_GetItem(args, 3));
+    int env_id = PyLong_AsLong(env_id_arg);
 
-    c_render(vec->envs[env_id], view_mode, draw_traces);
+    c_render(vec->envs[env_id]);
     Py_RETURN_NONE;
 }
 
@@ -642,43 +620,6 @@ static PyObject *vec_log(PyObject *self, PyObject *args) {
     return dict;
 }
 
-static PyObject *env_log(PyObject *self, PyObject *args) {
-    int num_args = PyTuple_Size(args);
-    if (num_args != 2) {
-        PyErr_SetString(PyExc_TypeError, "env_log requires 2 arguments");
-        return NULL;
-    }
-
-    Env *env = unpack_env(args);
-    if (!env) {
-        return NULL;
-    }
-
-    // Aggregate this env's per-agent logs (same as vec_log but for one env)
-    // Note: breaks horribly if you don't use floats
-    Log aggregate = {0};
-    int num_keys = sizeof(Log) / sizeof(float);
-    for (int j = 0; j < num_keys; j++) {
-        ((float *)&aggregate)[j] += ((float *)&env->log)[j];
-    }
-
-    PyObject *dict = PyDict_New();
-    if (aggregate.n == 0.0f) {
-        return dict;
-    }
-
-    // Average across agents in env
-    float n = aggregate.n;
-    for (int i = 0; i < num_keys; i++) {
-        ((float *)&aggregate)[i] /= n;
-    }
-    aggregate.n = (float)env->active_agent_count;
-
-    my_log(dict, &aggregate);
-
-    return dict;
-}
-
 static PyObject *vec_close(PyObject *self, PyObject *args) {
     VecEnv *vec = unpack_vecenv(args);
     if (!vec) {
@@ -692,19 +633,6 @@ static PyObject *vec_close(PyObject *self, PyObject *args) {
     free(vec->envs);
     free(vec);
     Py_RETURN_NONE;
-}
-
-static PyObject *vec_get_scenario_ids(PyObject *self, PyObject *args) {
-    VecEnv *vec = unpack_vecenv(args);
-    if (!vec)
-        return NULL;
-
-    PyObject *list = PyList_New(vec->num_envs);
-    for (int i = 0; i < vec->num_envs; i++) {
-        // scenario_id is char[16], may not be null-terminated at byte 16
-        PyList_SET_ITEM(list, i, PyUnicode_FromStringAndSize(vec->envs[i]->scenario_id, 16));
-    }
-    return list;
 }
 
 static PyObject *get_global_agent_state(PyObject *self, PyObject *args) {
@@ -806,9 +734,270 @@ static PyObject *vec_get_global_agent_state(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *vec_get_expert_agent_count(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int total = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total += c_get_expert_agent_count((Drive *)vec->envs[i]);
+    }
+    return PyLong_FromLong(total);
+}
+
+static PyObject *vec_inject_active_agent(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_inject_active_agent requires keyword args");
+        return NULL;
+    }
+    const char *keys[] = {"x", "y", "heading", "goal_x", "goal_y"};
+    float vals[5] = {0};
+    for (int k = 0; k < 5; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", keys[k]); return NULL; }
+        vals[k] = (float)PyFloat_AsDouble(obj);
+        if (PyErr_Occurred()) return NULL;
+    }
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) return NULL; }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+    int rc = inject_active_agent((Drive *)vec->envs[env_idx],
+                                 vals[0], vals[1], vals[2], vals[3], vals[4]);
+    return PyLong_FromLong(rc == 0 ? 1 : 0);
+}
+
+static PyObject *vec_inject_static_agent(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_inject_static_agent requires keyword args");
+        return NULL;
+    }
+    const char *keys[] = {"x", "y", "heading"};
+    float vals[3] = {0};
+    for (int k = 0; k < 3; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", keys[k]); return NULL; }
+        vals[k] = (float)PyFloat_AsDouble(obj);
+        if (PyErr_Occurred()) return NULL;
+    }
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) return NULL; }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+    int rc = inject_static_agent((Drive *)vec->envs[env_idx], vals[0], vals[1], vals[2]);
+    return PyLong_FromLong(rc == 0 ? 1 : 0);
+}
+
+static PyObject *vec_get_active_agent_count(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int total = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total += c_get_active_agent_count((Drive *)vec->envs[i]);
+    }
+    return PyLong_FromLong(total);
+}
+
+static PyObject *vec_teleport_agent(PyObject *self, PyObject *args) {
+    // args: (c_envs, env_idx, active_slot, world_x, world_y, heading, goal_x, goal_y)
+    if (PyTuple_Size(args) != 8) {
+        PyErr_SetString(PyExc_TypeError, "vec_teleport_agent requires 8 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int env_idx     = (int)PyLong_AsLong(PyTuple_GetItem(args, 1));
+    int active_slot = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    float world_x   = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 3));
+    float world_y   = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 4));
+    float heading   = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 5));
+    float goal_x    = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 6));
+    float goal_y    = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 7));
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range");
+        return NULL;
+    }
+    c_teleport_agent((Drive *)vec->envs[env_idx], active_slot, world_x, world_y, heading, goal_x, goal_y);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_teleport_static_agent(PyObject *self, PyObject *args) {
+    // args: (c_envs, env_idx, nonexpert_idx, world_x, world_y, heading)
+    if (PyTuple_Size(args) != 6) {
+        PyErr_SetString(PyExc_TypeError, "vec_teleport_static_agent requires 6 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int env_idx       = (int)PyLong_AsLong(PyTuple_GetItem(args, 1));
+    int nonexpert_idx = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    float world_x     = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 3));
+    float world_y     = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 4));
+    float heading     = (float)PyFloat_AsDouble(PyTuple_GetItem(args, 5));
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range");
+        return NULL;
+    }
+    c_teleport_static_agent((Drive *)vec->envs[env_idx], nonexpert_idx, world_x, world_y, heading);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_detach_active_agent(PyObject *self, PyObject *args) {
+    // args: (c_envs, env_idx, slot_idx)
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_detach_active_agent requires 3 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int env_idx  = (int)PyLong_AsLong(PyTuple_GetItem(args, 1));
+    int slot_idx = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range");
+        return NULL;
+    }
+    c_detach_active_agent((Drive *)vec->envs[env_idx], slot_idx);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_detach_static_agent(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_detach_static_agent requires 3 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int env_idx  = (int)PyLong_AsLong(PyTuple_GetItem(args, 1));
+    int slot_idx = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range");
+        return NULL;
+    }
+    c_detach_static_agent((Drive *)vec->envs[env_idx], slot_idx);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_detach_expert_agent(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_detach_expert_agent requires 3 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int env_idx  = (int)PyLong_AsLong(PyTuple_GetItem(args, 1));
+    int slot_idx = (int)PyLong_AsLong(PyTuple_GetItem(args, 2));
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range");
+        return NULL;
+    }
+    c_detach_expert_agent((Drive *)vec->envs[env_idx], slot_idx);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_expert_agent_state(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 6) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_expert_agent_state requires 6 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+
+    PyArrayObject *x_array   = (PyArrayObject *)PyTuple_GetItem(args, 1);
+    PyArrayObject *y_array   = (PyArrayObject *)PyTuple_GetItem(args, 2);
+    PyArrayObject *h_array   = (PyArrayObject *)PyTuple_GetItem(args, 3);
+    PyArrayObject *l_array   = (PyArrayObject *)PyTuple_GetItem(args, 4);
+    PyArrayObject *w_array   = (PyArrayObject *)PyTuple_GetItem(args, 5);
+
+    float *x_base = (float *)PyArray_DATA(x_array);
+    float *y_base = (float *)PyArray_DATA(y_array);
+    float *h_base = (float *)PyArray_DATA(h_array);
+    float *l_base = (float *)PyArray_DATA(l_array);
+    float *w_base = (float *)PyArray_DATA(w_array);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_get_expert_agent_state(drive, &x_base[offset], &y_base[offset],
+                                 &h_base[offset], &l_base[offset], &w_base[offset]);
+        offset += c_get_expert_agent_count(drive);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_agent_statuses(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 2) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_agent_statuses requires 2 arguments: (c_envs, status_int32_array)");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+
+    PyObject *status_obj = PyTuple_GetItem(args, 1);
+    if (!PyArray_Check(status_obj)) {
+        PyErr_SetString(PyExc_TypeError, "status array must be a NumPy int32 array");
+        return NULL;
+    }
+    int *status_base = (int *)PyArray_DATA((PyArrayObject *)status_obj);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_get_agent_statuses(drive, &status_base[offset]);
+        offset += drive->active_agent_count;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_static_agent_count(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int total = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        total += c_get_static_agent_count((Drive *)vec->envs[i]);
+    }
+    return PyLong_FromLong(total);
+}
+
+static PyObject *vec_get_static_agent_state(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 6) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_static_agent_state requires 6 arguments");
+        return NULL;
+    }
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+
+    PyArrayObject *x_array = (PyArrayObject *)PyTuple_GetItem(args, 1);
+    PyArrayObject *y_array = (PyArrayObject *)PyTuple_GetItem(args, 2);
+    PyArrayObject *h_array = (PyArrayObject *)PyTuple_GetItem(args, 3);
+    PyArrayObject *l_array = (PyArrayObject *)PyTuple_GetItem(args, 4);
+    PyArrayObject *w_array = (PyArrayObject *)PyTuple_GetItem(args, 5);
+
+    float *x_base = (float *)PyArray_DATA(x_array);
+    float *y_base = (float *)PyArray_DATA(y_array);
+    float *h_base = (float *)PyArray_DATA(h_array);
+    float *l_base = (float *)PyArray_DATA(l_array);
+    float *w_base = (float *)PyArray_DATA(w_array);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_get_static_agent_state(drive, &x_base[offset], &y_base[offset],
+                                 &h_base[offset], &l_base[offset], &w_base[offset]);
+        offset += c_get_static_agent_count(drive);
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *get_ground_truth_trajectories(PyObject *self, PyObject *args) {
-    if (PyTuple_Size(args) != 9) {
-        PyErr_SetString(PyExc_TypeError, "get_ground_truth_trajectories requires 9 arguments");
+    if (PyTuple_Size(args) != 7) {
+        PyErr_SetString(PyExc_TypeError, "get_ground_truth_trajectories requires 7 arguments");
         return NULL;
     }
 
@@ -826,13 +1015,10 @@ static PyObject *get_ground_truth_trajectories(PyObject *self, PyObject *args) {
     PyObject *heading_arr = PyTuple_GetItem(args, 4);
     PyObject *valid_arr = PyTuple_GetItem(args, 5);
     PyObject *id_arr = PyTuple_GetItem(args, 6);
-    PyObject *is_vehicle_arr = PyTuple_GetItem(args, 7);
-    PyObject *is_track_to_predict_arr = PyTuple_GetItem(args, 8);
-    PyObject *scenario_id_arr = PyTuple_GetItem(args, 9);
+    PyObject *scenario_id_arr = PyTuple_GetItem(args, 7);
 
     if (!PyArray_Check(x_arr) || !PyArray_Check(y_arr) || !PyArray_Check(z_arr) || !PyArray_Check(heading_arr) ||
-        !PyArray_Check(valid_arr) || !PyArray_Check(id_arr) || !PyArray_Check(is_vehicle_arr) ||
-        !PyArray_Check(is_track_to_predict_arr) || !PyArray_Check(scenario_id_arr)) {
+        !PyArray_Check(valid_arr) || !PyArray_Check(id_arr) || !PyArray_Check(scenario_id_arr)) {
         PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
         return NULL;
     }
@@ -843,19 +1029,17 @@ static PyObject *get_ground_truth_trajectories(PyObject *self, PyObject *args) {
     float *heading_data = (float *)PyArray_DATA((PyArrayObject *)heading_arr);
     int *valid_data = (int *)PyArray_DATA((PyArrayObject *)valid_arr);
     int *id_data = (int *)PyArray_DATA((PyArrayObject *)id_arr);
-    bool *is_vehicle_data = (bool *)PyArray_DATA((PyArrayObject *)is_vehicle_arr);
-    bool *is_track_to_predict_data = (bool *)PyArray_DATA((PyArrayObject *)is_track_to_predict_arr);
-    char *scenario_id_data = (char *)PyArray_DATA((PyArrayObject *)scenario_id_arr);
+    int *scenario_id_data = (int *)PyArray_DATA((PyArrayObject *)scenario_id_arr);
 
     c_get_global_ground_truth_trajectories(drive, x_data, y_data, z_data, heading_data, valid_data, id_data,
-                                           is_vehicle_data, is_track_to_predict_data, scenario_id_data);
+                                           scenario_id_data);
 
     Py_RETURN_NONE;
 }
 
 static PyObject *vec_get_global_ground_truth_trajectories(PyObject *self, PyObject *args) {
-    if (PyTuple_Size(args) != 10) {
-        PyErr_SetString(PyExc_TypeError, "vec_get_global_ground_truth_trajectories requires 10 arguments");
+    if (PyTuple_Size(args) != 8) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_global_ground_truth_trajectories requires 8 arguments");
         return NULL;
     }
 
@@ -871,13 +1055,10 @@ static PyObject *vec_get_global_ground_truth_trajectories(PyObject *self, PyObje
     PyObject *heading_arr = PyTuple_GetItem(args, 4);
     PyObject *valid_arr = PyTuple_GetItem(args, 5);
     PyObject *id_arr = PyTuple_GetItem(args, 6);
-    PyObject *is_vehicle_arr = PyTuple_GetItem(args, 7);
-    PyObject *is_track_to_predict_arr = PyTuple_GetItem(args, 8);
-    PyObject *scenario_id_arr = PyTuple_GetItem(args, 9);
+    PyObject *scenario_id_arr = PyTuple_GetItem(args, 7);
 
     if (!PyArray_Check(x_arr) || !PyArray_Check(y_arr) || !PyArray_Check(z_arr) || !PyArray_Check(heading_arr) ||
-        !PyArray_Check(valid_arr) || !PyArray_Check(id_arr) || !PyArray_Check(is_vehicle_arr) ||
-        !PyArray_Check(is_track_to_predict_arr) || !PyArray_Check(scenario_id_arr)) {
+        !PyArray_Check(valid_arr) || !PyArray_Check(id_arr) || !PyArray_Check(scenario_id_arr)) {
         PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
         return NULL;
     }
@@ -888,8 +1069,6 @@ static PyObject *vec_get_global_ground_truth_trajectories(PyObject *self, PyObje
     PyArrayObject *heading_array = (PyArrayObject *)heading_arr;
     PyArrayObject *valid_array = (PyArrayObject *)valid_arr;
     PyArrayObject *id_array = (PyArrayObject *)id_arr;
-    PyArrayObject *is_vehicle_array = (PyArrayObject *)is_vehicle_arr;
-    PyArrayObject *is_track_to_predict_array = (PyArrayObject *)is_track_to_predict_arr;
     PyArrayObject *scenario_id_array = (PyArrayObject *)scenario_id_arr;
 
     // Get base pointers to the arrays
@@ -899,9 +1078,7 @@ static PyObject *vec_get_global_ground_truth_trajectories(PyObject *self, PyObje
     float *heading_base = (float *)PyArray_DATA(heading_array);
     int *valid_base = (int *)PyArray_DATA(valid_array);
     int *id_base = (int *)PyArray_DATA(id_array);
-    bool *is_vehicle_base = (bool *)PyArray_DATA(is_vehicle_array);
-    bool *is_track_to_predict_base = (bool *)PyArray_DATA(is_track_to_predict_array);
-    char *scenario_id_base = (char *)PyArray_DATA(scenario_id_array);
+    int *scenario_id_base = (int *)PyArray_DATA(scenario_id_array);
 
     // Get number of timesteps from array shape
     npy_intp *x_shape = PyArray_DIMS(x_array);
@@ -914,10 +1091,9 @@ static PyObject *vec_get_global_ground_truth_trajectories(PyObject *self, PyObje
     for (int i = 0; i < vec->num_envs; i++) {
         Drive *drive = (Drive *)vec->envs[i];
 
-        c_get_global_ground_truth_trajectories(
-            drive, &x_base[traj_offset], &y_base[traj_offset], &z_base[traj_offset], &heading_base[traj_offset],
-            &valid_base[traj_offset], &id_base[agent_offset], &is_vehicle_base[agent_offset],
-            &is_track_to_predict_base[agent_offset], &scenario_id_base[agent_offset * 16]);
+        c_get_global_ground_truth_trajectories(drive, &x_base[traj_offset], &y_base[traj_offset], &z_base[traj_offset],
+                                               &heading_base[traj_offset], &valid_base[traj_offset],
+                                               &id_base[agent_offset], &scenario_id_base[agent_offset]);
 
         // Move offsets forward
         agent_offset += drive->active_agent_count;
@@ -967,7 +1143,7 @@ static PyObject *vec_get_road_edge_polylines(PyObject *self, PyObject *args) {
     float *x_base = (float *)PyArray_DATA((PyArrayObject *)x_arr);
     float *y_base = (float *)PyArray_DATA((PyArrayObject *)y_arr);
     int *lengths_base = (int *)PyArray_DATA((PyArrayObject *)lengths_arr);
-    char *scenario_ids_base = (char *)PyArray_DATA((PyArrayObject *)scenario_ids_arr);
+    int *scenario_ids_base = (int *)PyArray_DATA((PyArrayObject *)scenario_ids_arr);
 
     int poly_offset = 0, pt_offset = 0;
     for (int i = 0; i < vec->num_envs; i++) {
@@ -975,7 +1151,298 @@ static PyObject *vec_get_road_edge_polylines(PyObject *self, PyObject *args) {
         int np, tp;
         c_get_road_edge_counts(drive, &np, &tp);
         c_get_road_edge_polylines(drive, &x_base[pt_offset], &y_base[pt_offset], &lengths_base[poly_offset],
-                                  &scenario_ids_base[poly_offset * 16]);
+                                  &scenario_ids_base[poly_offset]);
+        poly_offset += np;
+        pt_offset += tp;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_recompute_observations(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        compute_observations(drive);
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_reset_injections(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++)
+        c_reset_injections((Drive *)vec->envs[i]);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_prepare_reserved_slots(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++)
+        prepare_reserved_slots((Drive *)vec->envs[i]);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_prepare_demo_slots(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++)
+        prepare_demo_slots((Drive *)vec->envs[i]);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_reset_demo_slots(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    for (int i = 0; i < vec->num_envs; i++)
+        reset_demo_slots((Drive *)vec->envs[i]);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_inject_demo_active_agent(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_inject_demo_active_agent requires keyword args");
+        return NULL;
+    }
+    const char *keys[] = {"x", "y", "heading", "goal_x", "goal_y"};
+    float vals[5] = {0};
+    for (int k = 0; k < 5; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", keys[k]); return NULL; }
+        vals[k] = (float)PyFloat_AsDouble(obj);
+        if (PyErr_Occurred()) return NULL;
+    }
+    float length = 0.0f, width = 0.0f;
+    PyObject *lobj = PyDict_GetItemString(kwargs, "length");
+    if (lobj) { length = (float)PyFloat_AsDouble(lobj); if (PyErr_Occurred()) return NULL; }
+    PyObject *wobj = PyDict_GetItemString(kwargs, "width");
+    if (wobj) { width  = (float)PyFloat_AsDouble(wobj); if (PyErr_Occurred()) return NULL; }
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) return NULL; }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+    int rc = inject_demo_active_agent((Drive *)vec->envs[env_idx],
+                                      vals[0], vals[1], vals[2], vals[3], vals[4],
+                                      length, width);
+    return PyLong_FromLong(rc);
+}
+
+static PyObject *vec_inject_demo_static_agent(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_inject_demo_static_agent requires keyword args");
+        return NULL;
+    }
+    const char *keys[] = {"x", "y", "heading"};
+    float vals[3] = {0};
+    for (int k = 0; k < 3; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", keys[k]); return NULL; }
+        vals[k] = (float)PyFloat_AsDouble(obj);
+        if (PyErr_Occurred()) return NULL;
+    }
+    float length = 0.0f, width = 0.0f;
+    PyObject *lobj = PyDict_GetItemString(kwargs, "length");
+    if (lobj) { length = (float)PyFloat_AsDouble(lobj); if (PyErr_Occurred()) return NULL; }
+    PyObject *wobj = PyDict_GetItemString(kwargs, "width");
+    if (wobj) { width  = (float)PyFloat_AsDouble(wobj); if (PyErr_Occurred()) return NULL; }
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) return NULL; }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+    int rc = inject_demo_static_agent((Drive *)vec->envs[env_idx], vals[0], vals[1], vals[2],
+                                      length, width);
+    return PyLong_FromLong(rc);
+}
+
+static PyObject *vec_inject_demo_expert_agent(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_inject_demo_expert_agent requires keyword args");
+        return NULL;
+    }
+    const char *keys[] = {"x", "y", "heading"};
+    float vals[3] = {0};
+    for (int k = 0; k < 3; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", keys[k]); return NULL; }
+        vals[k] = (float)PyFloat_AsDouble(obj);
+        if (PyErr_Occurred()) return NULL;
+    }
+    float length = 0.0f, width = 0.0f;
+    PyObject *lobj = PyDict_GetItemString(kwargs, "length");
+    if (lobj) { length = (float)PyFloat_AsDouble(lobj); if (PyErr_Occurred()) return NULL; }
+    PyObject *wobj = PyDict_GetItemString(kwargs, "width");
+    if (wobj) { width  = (float)PyFloat_AsDouble(wobj); if (PyErr_Occurred()) return NULL; }
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) return NULL; }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+    int rc = inject_demo_expert_agent((Drive *)vec->envs[env_idx], vals[0], vals[1], vals[2],
+                                      length, width);
+    return PyLong_FromLong(rc);
+}
+
+static PyObject *vec_set_demo_expert_traj(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_set_demo_expert_traj requires keyword args");
+        return NULL;
+    }
+    PyObject *sk_obj = PyDict_GetItemString(kwargs, "slot_k");
+    if (!sk_obj) { PyErr_SetString(PyExc_TypeError, "missing kwarg 'slot_k'"); return NULL; }
+    int slot_k = (int)PyLong_AsLong(sk_obj);
+    if (PyErr_Occurred()) return NULL;
+
+    const char *arr_keys[] = {"xs", "ys", "headings"};
+    Py_buffer bufs[3];
+    for (int k = 0; k < 3; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, arr_keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", arr_keys[k]); return NULL; }
+        if (PyObject_GetBuffer(obj, &bufs[k], PyBUF_SIMPLE | PyBUF_FORMAT) < 0) return NULL;
+    }
+    int n = (int)(bufs[0].len / sizeof(float));
+    if ((int)(bufs[1].len / sizeof(float)) != n || (int)(bufs[2].len / sizeof(float)) != n) {
+        for (int k = 0; k < 3; k++) PyBuffer_Release(&bufs[k]);
+        PyErr_SetString(PyExc_ValueError, "xs, ys, headings must have equal length");
+        return NULL;
+    }
+
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) { for (int k=0;k<3;k++) PyBuffer_Release(&bufs[k]); return NULL; } }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        for (int k = 0; k < 3; k++) PyBuffer_Release(&bufs[k]);
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+
+    set_demo_expert_traj((Drive *)vec->envs[env_idx], slot_k,
+                         (float *)bufs[0].buf, (float *)bufs[1].buf, (float *)bufs[2].buf, n);
+    for (int k = 0; k < 3; k++) PyBuffer_Release(&bufs[k]);
+    Py_RETURN_NONE;
+}
+
+// Reposition a native expert in place by replacing its trajectory (keeps its slot/ID).
+static PyObject *vec_teleport_expert_agent(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    if (!kwargs) {
+        PyErr_SetString(PyExc_TypeError, "vec_teleport_expert_agent requires keyword args");
+        return NULL;
+    }
+    PyObject *ei_obj = PyDict_GetItemString(kwargs, "expert_idx");
+    if (!ei_obj) { PyErr_SetString(PyExc_TypeError, "missing kwarg 'expert_idx'"); return NULL; }
+    int expert_idx = (int)PyLong_AsLong(ei_obj);
+    if (PyErr_Occurred()) return NULL;
+
+    const char *arr_keys[] = {"xs", "ys", "headings"};
+    Py_buffer bufs[3];
+    for (int k = 0; k < 3; k++) {
+        PyObject *obj = PyDict_GetItemString(kwargs, arr_keys[k]);
+        if (!obj) { PyErr_Format(PyExc_TypeError, "missing kwarg '%s'", arr_keys[k]); return NULL; }
+        if (PyObject_GetBuffer(obj, &bufs[k], PyBUF_SIMPLE | PyBUF_FORMAT) < 0) return NULL;
+    }
+    int n = (int)(bufs[0].len / sizeof(float));
+    if ((int)(bufs[1].len / sizeof(float)) != n || (int)(bufs[2].len / sizeof(float)) != n) {
+        for (int k = 0; k < 3; k++) PyBuffer_Release(&bufs[k]);
+        PyErr_SetString(PyExc_ValueError, "xs, ys, headings must have equal length");
+        return NULL;
+    }
+
+    int env_idx = 0;
+    PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+    if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) { for (int k=0;k<3;k++) PyBuffer_Release(&bufs[k]); return NULL; } }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        for (int k = 0; k < 3; k++) PyBuffer_Release(&bufs[k]);
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+
+    c_teleport_expert_agent((Drive *)vec->envs[env_idx], expert_idx,
+                            (float *)bufs[0].buf, (float *)bufs[1].buf, (float *)bufs[2].buf, n);
+    for (int k = 0; k < 3; k++) PyBuffer_Release(&bufs[k]);
+    Py_RETURN_NONE;
+}
+
+// Returns (used, total) for the demo shared slot pool of env_idx=0 (or specified env).
+static PyObject *vec_get_demo_slots_info(PyObject *self, PyObject *args, PyObject *kwargs) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+    int env_idx = 0;
+    if (kwargs) {
+        PyObject *eobj = PyDict_GetItemString(kwargs, "env_idx");
+        if (eobj) { env_idx = (int)PyLong_AsLong(eobj); if (PyErr_Occurred()) return NULL; }
+    }
+    if (env_idx < 0 || env_idx >= vec->num_envs) {
+        PyErr_SetString(PyExc_IndexError, "env_idx out of range"); return NULL;
+    }
+    Drive *d = (Drive *)vec->envs[env_idx];
+    // Return (used, total) where total=MAX_AGENTS so Python computes free=total-used correctly.
+    int n_free = d->demo_n_free_slots;
+    return Py_BuildValue("(ii)", MAX_AGENTS - n_free, MAX_AGENTS);
+}
+
+static PyObject *vec_get_lane_counts(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    int total_polylines = 0, total_points = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        int np, tp;
+        c_get_lane_counts(drive, &np, &tp);
+        total_polylines += np;
+        total_points += tp;
+    }
+    return Py_BuildValue("(ii)", total_polylines, total_points);
+}
+
+static PyObject *vec_get_lane_polylines(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 5) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_lane_polylines requires 5 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    PyObject *x_arr = PyTuple_GetItem(args, 1);
+    PyObject *y_arr = PyTuple_GetItem(args, 2);
+    PyObject *lengths_arr = PyTuple_GetItem(args, 3);
+    PyObject *scenario_ids_arr = PyTuple_GetItem(args, 4);
+
+    if (!PyArray_Check(x_arr) || !PyArray_Check(y_arr) || !PyArray_Check(lengths_arr) ||
+        !PyArray_Check(scenario_ids_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *x_base = (float *)PyArray_DATA((PyArrayObject *)x_arr);
+    float *y_base = (float *)PyArray_DATA((PyArrayObject *)y_arr);
+    int *lengths_base = (int *)PyArray_DATA((PyArrayObject *)lengths_arr);
+    int *scenario_ids_base = (int *)PyArray_DATA((PyArrayObject *)scenario_ids_arr);
+
+    int poly_offset = 0, pt_offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        int np, tp;
+        c_get_lane_counts(drive, &np, &tp);
+        c_get_lane_polylines(drive, &x_base[pt_offset], &y_base[pt_offset], &lengths_base[poly_offset],
+                             &scenario_ids_base[poly_offset]);
         poly_offset += np;
         pt_offset += tp;
     }
@@ -1046,7 +1513,6 @@ static PyMethodDef methods[] = {
     {"env_close", env_close, METH_VARARGS, "Close the environment"},
     {"env_get", env_get, METH_VARARGS, "Get the environment state"},
     {"env_put", (PyCFunction)env_put, METH_VARARGS | METH_KEYWORDS, "Put stuff into env"},
-    {"env_log", env_log, METH_VARARGS, "Log stats for a single environment"},
     {"vectorize", vectorize, METH_VARARGS, "Make a vector of environment handles"},
     {"vec_init", (PyCFunction)vec_init, METH_VARARGS | METH_KEYWORDS, "Initialize a vector of environments"},
     {"vec_reset", vec_reset, METH_VARARGS, "Reset the vector of environments"},
@@ -1054,10 +1520,23 @@ static PyMethodDef methods[] = {
     {"vec_log", vec_log, METH_VARARGS, "Log the vector of environments"},
     {"vec_render", vec_render, METH_VARARGS, "Render the vector of environments"},
     {"vec_close", vec_close, METH_VARARGS, "Close the vector of environments"},
-    {"vec_get_scenario_ids", vec_get_scenario_ids, METH_VARARGS, "Get scenario IDs for all envs"},
     {"shared", (PyCFunction)my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
     {"get_global_agent_state", get_global_agent_state, METH_VARARGS, "Get global agent state"},
     {"vec_get_global_agent_state", vec_get_global_agent_state, METH_VARARGS, "Get agent state from vectorized env"},
+    {"vec_get_expert_agent_count", vec_get_expert_agent_count, METH_VARARGS, "Get total expert agent count from vectorized env"},
+    {"vec_get_expert_agent_state", vec_get_expert_agent_state, METH_VARARGS, "Get expert (non-controlled) agent state from vectorized env"},
+    {"vec_get_agent_statuses", vec_get_agent_statuses, METH_VARARGS, "Get per-agent status codes (0=running,1=paused,2=crashed,3=offroad,4=goal_reached)"},
+    {"vec_get_static_agent_count", vec_get_static_agent_count, METH_VARARGS, "Get total static (parked) agent count from vectorized env"},
+    {"vec_get_static_agent_state", vec_get_static_agent_state, METH_VARARGS, "Get static (parked) agent state from vectorized env"},
+    {"vec_get_active_agent_count", vec_get_active_agent_count, METH_VARARGS, "Get total active (policy-controlled) agent count"},
+    {"vec_teleport_agent", vec_teleport_agent, METH_VARARGS, "Teleport an active agent to a new position/heading/goal"},
+    {"vec_teleport_static_agent", vec_teleport_static_agent, METH_VARARGS, "Reposition a non-expert static agent in place (keeps its slot/identity)"},
+    {"vec_teleport_expert_agent", (PyCFunction)vec_teleport_expert_agent, METH_VARARGS | METH_KEYWORDS, "Reposition an expert agent in place by replacing its trajectory (keeps its slot/identity)"},
+    {"vec_detach_active_agent", vec_detach_active_agent, METH_VARARGS, "Remove an active agent from the pool (frees a slot for demo injection in full scenes)"},
+    {"vec_detach_static_agent", vec_detach_static_agent, METH_VARARGS, "Remove a non-expert static agent from the pool (frees a slot for demo injection)"},
+    {"vec_detach_expert_agent", vec_detach_expert_agent, METH_VARARGS, "Remove an expert static agent from the pool (frees a slot for demo injection)"},
+    {"vec_inject_active_agent", (PyCFunction)vec_inject_active_agent, METH_VARARGS | METH_KEYWORDS, "Inject a new policy-controlled agent (hijacks an inactive vehicle slot)"},
+    {"vec_inject_static_agent", (PyCFunction)vec_inject_static_agent, METH_VARARGS | METH_KEYWORDS, "Inject a new non-moving static agent"},
     {"get_ground_truth_trajectories", get_ground_truth_trajectories, METH_VARARGS, "Get ground truth trajectories"},
     {"vec_get_global_ground_truth_trajectories", vec_get_global_ground_truth_trajectories, METH_VARARGS,
      "Get ground truth trajectories from vectorized env"},
@@ -1065,6 +1544,30 @@ static PyMethodDef methods[] = {
      "Get road edge polyline counts from vectorized env"},
     {"vec_get_road_edge_polylines", vec_get_road_edge_polylines, METH_VARARGS,
      "Get road edge polylines from vectorized env"},
+    {"vec_recompute_observations", vec_recompute_observations, METH_VARARGS,
+     "Recompute observations for all envs (call after set_goals to keep observations in sync)"},
+    {"vec_reset_injections", vec_reset_injections, METH_VARARGS,
+     "Restore agent counts to original post-init values, discarding all injected agents"},
+    {"vec_prepare_reserved_slots", vec_prepare_reserved_slots, METH_VARARGS,
+     "Pre-reserve N_INJECTION_RESERVE vehicle slots for robust injection (park them at -9000,-9000)"},
+    {"vec_prepare_demo_slots", vec_prepare_demo_slots, METH_VARARGS,
+     "Allocate MAX_AGENTS-num_actors shared demo slots (active/static/expert) parked at INVALID_POSITION"},
+    {"vec_reset_demo_slots", vec_reset_demo_slots, METH_VARARGS,
+     "Park all demo slots back to INVALID_POSITION (call before re-injecting user agents)"},
+    {"vec_inject_demo_active_agent", (PyCFunction)vec_inject_demo_active_agent, METH_VARARGS | METH_KEYWORDS,
+     "Promote a free shared demo slot to active agent; returns slot index k or -1 if full"},
+    {"vec_inject_demo_static_agent", (PyCFunction)vec_inject_demo_static_agent, METH_VARARGS | METH_KEYWORDS,
+     "Place a user static agent into a free shared demo slot; returns slot index k or -1 if full"},
+    {"vec_inject_demo_expert_agent", (PyCFunction)vec_inject_demo_expert_agent, METH_VARARGS | METH_KEYWORDS,
+     "Place a user expert agent into a free shared demo slot; returns slot_k or -1 if full"},
+    {"vec_set_demo_expert_traj", (PyCFunction)vec_set_demo_expert_traj, METH_VARARGS | METH_KEYWORDS,
+     "Write xs/ys/headings trajectory into demo slot slot_k (must be an expert slot)"},
+    {"vec_get_demo_slots_info", (PyCFunction)vec_get_demo_slots_info, METH_VARARGS | METH_KEYWORDS,
+     "Returns (used, total) for the shared demo slot pool"},
+    {"vec_get_lane_counts", vec_get_lane_counts, METH_VARARGS,
+     "Get lane polyline counts from vectorized env"},
+    {"vec_get_lane_polylines", vec_get_lane_polylines, METH_VARARGS,
+     "Get lane polylines from vectorized env"},
     MY_METHODS,
     {NULL, NULL, 0, NULL}};
 

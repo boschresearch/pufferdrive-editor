@@ -1,3 +1,11 @@
+# Copyright (c) 2026 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+# Copyright (c) PufferDrive authors, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 import time
 import json
 import numpy as np
@@ -14,7 +22,7 @@ def test_simulator_raw():
     num_agents = 32
 
     # ---- Run simulation ----
-    env = Drive(num_agents=num_agents, num_maps=1, episode_length=91, map_dir="resources/drive/binaries")
+    env = Drive(num_agents=num_agents, num_maps=1, scenario_length=91, split="training")
     obs, _ = env.reset()
     tick = 0
 

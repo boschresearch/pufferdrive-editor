@@ -69,7 +69,7 @@ Now create a file called **`launch.json`** with the following content:
       "module": "pufferlib.pufferl",
       "args": ["train", "puffer_drive"],
       "cwd": "${workspaceFolder}",
-      "python": "/home/ricky/git/PufferDrive/.venv/bin/python", // <- TODO: point to your python interpreter
+      "python": "${workspaceFolder}/.venv/bin/python", // <- TODO: point to your python interpreter
       "justMyCode": false,
       "env": {
         "PYTHONPATH": "${workspaceFolder}"
@@ -81,7 +81,7 @@ Now create a file called **`launch.json`** with the following content:
       "name": "C (gdb): Debug C inside puffer_drive",
       "type": "cppdbg",
       "request": "launch",
-      "program": "/home/ricky/git/PufferDrive/.venv/bin/python", // <- TODO: point to your python interpreter
+      "program": "${workspaceFolder}/.venv/bin/python", // <- TODO: point to your python interpreter
       "args": ["-m", "pufferlib.pufferl", "train", "puffer_drive"],
       "cwd": "${workspaceFolder}",
       "MIMode": "gdb",

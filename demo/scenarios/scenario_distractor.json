@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "meta": {
+    "selected_split": "testing",
+    "selected_map": 10,
+    "selected_map_path": "",
+    "map_id_input": "10",
+    "sim_steps": 91,
+    "selected_policy_path": "pufferlib/resources/drive/model_puffer_drive_003815.pt",
+    "selected_policy_config": "",
+    "ghost_policy_path": "pufferlib/resources/drive/model_puffer_drive_003815.pt",
+    "ghost_policy_config": ""
+  },
+  "flags": {
+    "ghost_env_active": false,
+    "ghost_side_by_side": false,
+    "mirror_placement": false,
+    "env_focus": "primary",
+    "ghost_diverge_frame": 0,
+    "agent_size": "M",
+    "static_size": "M",
+    "expert_size": "M",
+    "show_goals": true,
+    "show_goal_radius": true,
+    "show_labels": true,
+    "show_trajectories": true
+  },
+  "_desc": "Distractor: native slot 9 (and a second agent) are retargeted across the flow toward real off-lane goals, forcing the compliant agents to brake, yield and reroute.",
+  "primary": {
+    "user_agents": [],
+    "user_static_agents": [],
+    "user_expert_agents": [],
+    "goal_overrides": {
+      "9": [
+        960.436279296875,
+        -2557.986328125
+      ],
+      "12": [
+        899.746337890625,
+        -2656.60498046875
+      ]
+    },
+    "removed_slots": [],
+    "removed_static_slots": [],
+    "removed_native_expert_idxs": [],
+    "pending_static_detach_slots": [],
+    "pending_expert_detach_idxs": [],
+    "env_has_detaches": false,
+    "native_active_moves": {},
+    "native_static_moves": {},
+    "native_expert_moves": {}
+  },
+  "ghost": {
+    "user_agents": [],
+    "user_static_agents": [],
+    "user_expert_agents": [],
+    "goal_overrides": {},
+    "removed_slots": [],
+    "removed_static_slots": [],
+    "removed_native_expert_idxs": [],
+    "native_active_moves": {},
+    "native_static_moves": {},
+    "native_expert_moves": {}
+  }
+}

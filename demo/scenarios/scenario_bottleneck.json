@@ -1,0 +1,94 @@
+{
+  "version": 1,
+  "meta": {
+    "selected_split": "testing",
+    "selected_map": 1,
+    "selected_map_path": "",
+    "map_id_input": "1",
+    "sim_steps": 91,
+    "selected_policy_path": "pufferlib/resources/drive/model_puffer_drive_003815.pt",
+    "selected_policy_config": "",
+    "ghost_policy_path": "pufferlib/resources/drive/model_puffer_drive_003815.pt",
+    "ghost_policy_config": ""
+  },
+  "flags": {
+    "ghost_env_active": false,
+    "ghost_side_by_side": false,
+    "mirror_placement": false,
+    "env_focus": "primary",
+    "ghost_diverge_frame": 0,
+    "agent_size": "M",
+    "static_size": "M",
+    "expert_size": "M",
+    "show_goals": true,
+    "show_goal_radius": true,
+    "show_labels": true,
+    "show_trajectories": true
+  },
+  "_desc": "Bottleneck: native west-bound stream meets injected east-bound agents in one narrowed lane; opposing cars must negotiate right-of-way.",
+  "primary": {
+    "user_agents": [
+      {
+        "x": 8735.3193359375,
+        "y": 4703.9091796875,
+        "heading": -0.007014598737471955,
+        "goal_x": 8755.296875,
+        "goal_y": 4703.76904296875,
+        "label": "HEAD0",
+        "length": 4.5,
+        "width": 2.0
+      },
+      {
+        "x": 8834.2734375,
+        "y": 4703.55029296875,
+        "heading": -0.018349324205709887,
+        "goal_x": 8853.75,
+        "goal_y": 4703.19287109375,
+        "label": "HEAD1",
+        "length": 4.5,
+        "width": 2.0
+      }
+    ],
+    "user_static_agents": [
+      {
+        "x": 8745.287061845112,
+        "y": 4700.839185134716,
+        "heading": 3.134578054852321,
+        "label": "WALLa",
+        "length": 4.5,
+        "width": 2.0
+      },
+      {
+        "x": 8745.33055200063,
+        "y": 4707.039032601095,
+        "heading": 3.134578054852321,
+        "label": "WALLb",
+        "length": 4.5,
+        "width": 2.0
+      }
+    ],
+    "user_expert_agents": [],
+    "goal_overrides": {},
+    "removed_slots": [],
+    "removed_static_slots": [],
+    "removed_native_expert_idxs": [],
+    "pending_static_detach_slots": [],
+    "pending_expert_detach_idxs": [],
+    "env_has_detaches": false,
+    "native_active_moves": {},
+    "native_static_moves": {},
+    "native_expert_moves": {}
+  },
+  "ghost": {
+    "user_agents": [],
+    "user_static_agents": [],
+    "user_expert_agents": [],
+    "goal_overrides": {},
+    "removed_slots": [],
+    "removed_static_slots": [],
+    "removed_native_expert_idxs": [],
+    "native_active_moves": {},
+    "native_static_moves": {},
+    "native_expert_moves": {}
+  }
+}

@@ -1,3 +1,11 @@
+# Copyright (c) 2026 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+# Copyright (c) PufferDrive authors, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 ## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full detail0
 # This is the same as python -m pufferlib.pufferl [train | eval | sweep] [env_name] [optional args]
 # Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
@@ -36,8 +44,6 @@ import pufferlib.vector
 import pufferlib.pytorch
 import pufferlib.utils
 
-from pufferlib.ocean.benchmark.evaluator import Evaluator
-
 try:
     from pufferlib import _C
 except ImportError:
@@ -62,8 +68,7 @@ ADVANTAGE_CUDA = shutil.which("nvcc") is not None
 
 
 class PuffeRL:
-    def __init__(self, config, vecenv, policy, logger=None, full_args=None):
-        self.full_args = full_args
+    def __init__(self, config, vecenv, policy, logger=None):
         # Backend perf optimization
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.deterministic = config["torch_deterministic"]
@@ -79,34 +84,28 @@ class PuffeRL:
         vecenv.async_reset(seed)
         obs_space = vecenv.single_observation_space
         atn_space = vecenv.single_action_space
-        # The number of concurrent agents running in the vectorized environments
         total_agents = vecenv.num_agents
         self.total_agents = total_agents
 
         # Experience
-        if config["batch_size"] == "auto" and config["rollout_horizon"] == "auto":
-            raise pufferlib.APIUsageError("Must specify batch_size or rollout_horizon")
+        if config["batch_size"] == "auto" and config["bptt_horizon"] == "auto":
+            raise pufferlib.APIUsageError("Must specify batch_size or bptt_horizon")
         elif config["batch_size"] == "auto":
-            config["batch_size"] = total_agents * config["rollout_horizon"]
-        elif config["rollout_horizon"] == "auto":
-            config["rollout_horizon"] = config["batch_size"] // total_agents
+            config["batch_size"] = total_agents * config["bptt_horizon"]
+        elif config["bptt_horizon"] == "auto":
+            config["bptt_horizon"] = config["batch_size"] // total_agents
 
         batch_size = config["batch_size"]
-        rollout_horizon = config["rollout_horizon"]
-        bptt_horizon = config["rollout_horizon"]  # LSTM backprop horizon
-        config["bptt_horizon"] = bptt_horizon
-        segments = batch_size // rollout_horizon  # Use rollout_horizon
-
-        # Number of independent rollout sequences stored in the experience buffer
+        horizon = config["bptt_horizon"]
+        segments = batch_size // horizon
         self.segments = segments
-
         if total_agents > segments:
             raise pufferlib.APIUsageError(f"Total agents {total_agents} <= segments {segments}")
 
         device = config["device"]
         self.observations = torch.zeros(
             segments,
-            rollout_horizon,
+            horizon+1,
             *obs_space.shape,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[obs_space.dtype],
             pin_memory=device == "cuda" and config["cpu_offload"],
@@ -114,21 +113,26 @@ class PuffeRL:
         )
         self.actions = torch.zeros(
             segments,
-            rollout_horizon,
+            horizon,
             *atn_space.shape,
             device=device,
             dtype=pufferlib.pytorch.numpy_to_torch_dtype_dict[atn_space.dtype],
         )
-        self.values = torch.zeros(segments, rollout_horizon, device=device)
-        self.logprobs = torch.zeros(segments, rollout_horizon, device=device)
-        self.rewards = torch.zeros(segments, rollout_horizon, device=device)
-        self.terminals = torch.zeros(segments, rollout_horizon, device=device)
-        self.truncations = torch.zeros(segments, rollout_horizon, device=device)
-        self.ratio = torch.ones(segments, rollout_horizon, device=device)
-        self.importance = torch.ones(segments, rollout_horizon, device=device)
+        self.values = torch.zeros(segments, horizon+1, device=device) # +1 for next state value for advantage calculation at the end of an episode
+        self.logprobs = torch.zeros(segments, horizon, device=device)
+        self.rewards = torch.zeros(segments, horizon+1, device=device)
+        self.terminals = torch.zeros(segments, horizon, device=device)
+        self.truncations = torch.zeros(segments, horizon, device=device)
+        self.ratio = torch.ones(segments, horizon, device=device)
+        self.importance = torch.ones(segments, horizon, device=device)
         self.ep_lengths = torch.zeros(total_agents, device=device, dtype=torch.int32)
         self.ep_indices = torch.arange(total_agents, device=device, dtype=torch.int32)
         self.free_idx = total_agents
+        self.render = config["render"]
+        self.render_interval = config["render_interval"]
+
+        if self.render:
+            ensure_drive_binary()
 
         # LSTM
         if config["use_rnn"]:
@@ -151,10 +155,10 @@ class PuffeRL:
 
         self.accumulate_minibatches = max(1, minibatch_size // max_minibatch_size)
         self.total_minibatches = int(config["update_epochs"] * batch_size / self.minibatch_size)
-        self.minibatch_segments = self.minibatch_size // rollout_horizon
-        if self.minibatch_segments * rollout_horizon != self.minibatch_size:
+        self.minibatch_segments = self.minibatch_size // horizon
+        if self.minibatch_segments * horizon != self.minibatch_size:
             raise pufferlib.APIUsageError(
-                f"minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {rollout_horizon}"
+                f"minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {horizon}"
             )
 
         # Torch compile
@@ -203,8 +207,6 @@ class PuffeRL:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         self.total_epochs = epochs
 
-        self.ent_coef_initial = config["ent_coef"]
-
         # Automatic mixed precision
         precision = config["precision"]
         self.amp_context = contextlib.nullcontext()
@@ -226,6 +228,8 @@ class PuffeRL:
         self.stats = defaultdict(list)
         self.last_stats = defaultdict(list)
         self.losses = {}
+
+        # self.rollout_transition_buffer = [] ## currently not used since this leads to some kind of deadlock
 
         # Dashboard
         self.model_size = sum(p.numel() for p in policy.parameters() if p.requires_grad)
@@ -259,11 +263,22 @@ class PuffeRL:
         self.full_rows = 0
         while self.full_rows < self.segments:
             profile("env", epoch)
-            o, r, d, t, info, env_id, mask = self.vecenv.recv()
 
+            # if len(self.rollout_transition_buffer) > 0 and self.full_rows == 0:
+            #     o, r, d, t, info, env_id, mask = self.rollout_transition_buffer.pop(0)
+            #     self.vecenv.enable_send()
+            #     print("Took from buffer")
+            # else:
+            #     print("recv")
+            #     o, r, d, t, info, env_id, mask = self.vecenv.recv()
+
+                
+            o, r, d, t, info, env_id, mask = self.vecenv.recv()
+            
             profile("eval_misc", epoch)
             env_id = slice(env_id[0], env_id[-1] + 1)
 
+            done_mask = d + t  # TODO: Handle truncations separately
             self.global_step += int(mask.sum())
 
             profile("eval_copy", epoch)
@@ -272,13 +287,12 @@ class PuffeRL:
             r = torch.as_tensor(r).to(device)  # , non_blocking=True)
             d = torch.as_tensor(d).to(device)  # , non_blocking=True)
             t = torch.as_tensor(t).to(device)  # , non_blocking=True)
-            done_mask = (d + t).clamp(max=1)
 
             profile("eval_forward", epoch)
             with torch.no_grad(), self.amp_context:
                 state = dict(
                     reward=r,
-                    done=done_mask,
+                    done=d,
                     env_id=env_id,
                     mask=mask,
                 )
@@ -287,15 +301,20 @@ class PuffeRL:
                     state["lstm_h"] = self.lstm_h[env_id.start]
                     state["lstm_c"] = self.lstm_c[env_id.start]
 
-                logits, value = self.policy.forward_eval(o_device, state)
+                logits, value = self.policy.forward_eval(o_device, state) # actions are ignored, if state is truncated!
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 r = torch.clamp(r, -1, 1)
 
             profile("eval_copy", epoch)
             with torch.no_grad():
                 if config["use_rnn"]:
+                    state["lstm_h"][t, :] = 0.0 # state got truncated -> set it to 0! What about terminals? do the same?
+                    state["lstm_c"][t, :] = 0.0
                     self.lstm_h[env_id.start] = state["lstm_h"]
                     self.lstm_c[env_id.start] = state["lstm_c"]
+
+                    # if state truncated, lstm_c and lstm_h should be set to 0
+
 
                 # Fast path for fully vectorized envs
                 l = self.ep_lengths[env_id.start].item()
@@ -306,28 +325,28 @@ class PuffeRL:
                 else:
                     self.observations[batch_rows, l] = o_device
 
-                self.actions[batch_rows, l] = action
-                self.logprobs[batch_rows, l] = logprob
-                # Truncation bootstrap hack for auto-reset envs.
-                # Ideally we add `gamma * V(s_{t+1})` on truncation steps, but Drive resets in C so
-                # the value at index `l` is post-reset. We use `values[..., l-1]` as a heuristic
-                # proxy for the pre-reset terminal value (bootstrap term is not clipped).
-                if l > 0:
-                    trunc_mask = (t > 0) & (d == 0)
-                    r = r + trunc_mask.to(r.dtype) * config["gamma"] * self.values[batch_rows, l - 1]
                 self.rewards[batch_rows, l] = r
-                self.terminals[batch_rows, l] = done_mask.float()
-                self.truncations[batch_rows, l] = t.float()
                 self.values[batch_rows, l] = value.flatten()
+
+                if l < config["bptt_horizon"]:
+                    self.actions[batch_rows, l] = action
+                    self.logprobs[batch_rows, l] = logprob
+                    self.terminals[batch_rows, l] = d.float()
+                    self.truncations[batch_rows, l] = t.float()
+
 
                 # Note: We are not yet handling masks in this version
                 self.ep_lengths[env_id] += 1
-                if l + 1 >= config["bptt_horizon"]:
+                if l >= config["bptt_horizon"]:
                     num_full = env_id.stop - env_id.start
                     self.ep_indices[env_id] = self.free_idx + torch.arange(num_full, device=config["device"]).int()
                     self.ep_lengths[env_id] = 0
                     self.free_idx += num_full
                     self.full_rows += num_full
+
+                    ## add to rollout_transition_buffer
+                    # env_id = [env_id.start, env_id.stop -1 ]
+                    # self.rollout_transition_buffer.append((o, r, d, t, info, env_id, mask))
 
                 action = action.cpu().numpy()
                 if isinstance(logits, torch.distributions.Normal):
@@ -344,7 +363,66 @@ class PuffeRL:
                         self.stats[k].append(v)
 
             profile("env", epoch)
+
+            # if l < config["bptt_horizon"]:
+            #     self.vecenv.send(action)
+            # else:
+            #     ## enable to recv again
+            #     self.vecenv.enable_recv()
+            
             self.vecenv.send(action)
+
+
+
+        # if it is the last step of the episode_length, store the next observation to get the value of the next state for advantage calculation
+        # next observation is not vaild, if there is a truncation! -> or check truncation handling in drive.h
+        # chunk = self.vecenv.agents_per_worker * self.vecenv.workers_per_batch
+        # num_agents = self.vecenv.num_agents
+        # for start in range(0, num_agents, chunk):
+        #     end = start + chunk
+        #     agent_slice = slice (start, end)
+        #     obs, r, d, _, mask, truncations = self.vecenv.sync_get_observations(agent_slice, timeout=3.0)
+        #     o = torch.as_tensor(obs)
+        #     o_device = o.to(device)  # , non_blocking=True)
+        #     r = torch.as_tensor(r).to(device)  # , non_blocking=True)
+        #     d = torch.as_tensor(d).to(device)  # , non_blocking=True)
+        #     truncations = torch.as_tensor(truncations).to(device)
+        #     batch_rows = slice(self.ep_indices[agent_slice.start].item(), 1 + self.ep_indices[agent_slice.stop - 1].item())
+        #     with torch.no_grad():
+        #         r = torch.clamp(r, -1, 1)
+        #         if config["cpu_offload"]:
+        #             self.observations[agent_slice, l+1] = o
+        #         else:
+        #             self.observations[agent_slice, l+1] = o_device
+        #         self.rewards[agent_slice, l+1] = r
+
+        #     with torch.no_grad(), self.amp_context:
+        #         state = dict(
+        #             reward=r,
+        #             done=d,
+        #             env_id=agent_slice,
+        #             mask=mask,
+        #         )
+
+        #         if config["use_rnn"]:
+        #             state["lstm_h"] = self.lstm_h[agent_slice.start]
+        #             state["lstm_c"] = self.lstm_c[agent_slice.start]
+        #         # TODO: if statement here to avoid that cuda cracks?
+        #         _, value = self.policy.forward_eval(o_device, state)
+        #         self.values[agent_slice, l+1] = value.flatten()
+
+
+            # if self.full_rows >= self.segments:
+            #     o, _, _, _, _, _, _ = self.vecenv.recv()
+            #     o = torch.as_tensor(o)
+            #     o_device = o.to(device)  # , non_blocking=True)
+            #     with torch.no_grad():
+            #         print("Storing the very last observation for value calculation!")
+            #         print("This is not necessarily the right batch for batch_rows!!!")
+            #         if config["cpu_offload"]:
+            #             self.observations[batch_rows, l+1] = o
+            #         else:
+            #             self.observations[batch_rows, l+1] = o_device
 
         profile("eval_misc", epoch)
         self.free_idx = self.total_agents
@@ -372,13 +450,17 @@ class PuffeRL:
         for mb in range(self.total_minibatches):
             profile("train_misc", epoch, nest=True)
             self.amp_context.__enter__()
-
-            shape = self.values.shape
+            shape = self.truncations.shape
+            # advantages are calculated here for priority weighting
             advantages = torch.zeros(shape, device=device)
+            adv_terminal = torch.empty((self.terminals.shape[0], self.terminals.shape[1]+1), device=device)
+            adv_terminal[:, :-1] = self.terminals
+            adv_terminal[:, -1] = self.terminals[:, -1]
             advantages = compute_puff_advantage(
                 self.values,
                 self.rewards,
-                self.terminals,
+                adv_terminal, # self.terminals
+                self.truncations,
                 self.ratio,
                 advantages,
                 config["gamma"],
@@ -388,10 +470,22 @@ class PuffeRL:
             )
 
             profile("train_copy", epoch)
-            adv = advantages.abs().sum(axis=1)
-            prio_weights = torch.nan_to_num(adv**a, 0, 0, 0)
+            # for doing priority sampling, we also need masking, TODO: get invalid value states (if simulation was not fast enough)
+            terminals = self.terminals.bool()
+            terminals_shifted = torch.cat([torch.zeros_like(terminals[:, :1]), terminals[:, :-1]],dim=1)
+            invalid_mask = terminals & terminals_shifted
+            invalid_observations = (self.observations[:, -1, 0] == -1000)# if workers were too slow to perform the action in sync_get_observations function
+            invalid_mask[:, -1] = invalid_mask[:, -1] | invalid_observations
+            invalid_mask = invalid_mask | self.truncations.bool()
+
+            masked_advantages = advantages*~invalid_mask
+            adv = masked_advantages.abs().sum(axis=1) # sum across sequence length
+            valid_steps = (~invalid_mask).sum(axis=1) +1e-6
+            adv_avg = adv / valid_steps
+            # TODO: This may be to harsh -> normalizing it before can help to not produce extreme probabilities with **a!
+            prio_weights = torch.nan_to_num(adv_avg**a, 0, 0, 0)
             prio_probs = (prio_weights + 1e-6) / (prio_weights.sum() + 1e-6)
-            idx = torch.multinomial(prio_probs, self.minibatch_segments)
+            idx = torch.multinomial(prio_probs, self.minibatch_segments) # indices are drawn by important agents and not timesteps
             mb_prio = (self.segments * prio_probs[idx, None]) ** -anneal_beta
             mb_obs = self.observations[idx]
             mb_actions = self.actions[idx]
@@ -401,7 +495,7 @@ class PuffeRL:
             mb_truncations = self.truncations[idx]
             mb_ratio = self.ratio[idx]
             mb_values = self.values[idx]
-            mb_returns = advantages[idx] + mb_values
+            mb_returns = advantages[idx] + mb_values[:, :-1]
             mb_advantages = advantages[idx]
 
             profile("train_forward", epoch)
@@ -413,8 +507,9 @@ class PuffeRL:
                 lstm_h=None,
                 lstm_c=None,
             )
-
-            logits, newvalue = self.policy(mb_obs, state)
+            trunc_or_term_before = torch.zeros(mb_truncations.shape, device=mb_truncations.device) # truncated at previous timestep
+            trunc_or_term_before[:, 1:] = mb_truncations[:, :-1].bool() | mb_terminals[:, :-1].bool()
+            logits, newvalue = self.policy(mb_obs[:, :-1], state, trunc_or_term_before)
             actions, newlogprob, entropy = pufferlib.pytorch.sample_logits(logits, action=mb_actions)
 
             profile("train_misc", epoch)
@@ -429,10 +524,13 @@ class PuffeRL:
                 clipfrac = ((ratio - 1.0).abs() > config["clip_coef"]).float().mean()
 
             adv = advantages[idx]
+            terminals_extended = torch.cat((mb_terminals, mb_terminals[:, -1:]), dim=1)
+            # is this really necessary??
             adv = compute_puff_advantage(
                 mb_values,
                 mb_rewards,
-                mb_terminals,
+                terminals_extended,
+                mb_truncations,
                 ratio,
                 adv,
                 config["gamma"],
@@ -440,35 +538,47 @@ class PuffeRL:
                 config["vtrace_rho_clip"],
                 config["vtrace_c_clip"],
             )
-            adv = mb_advantages
-            adv = mb_prio * (adv - adv.mean()) / (adv.std() + 1e-8)
+            # after a terminal, we do not want to use it for the policy gradient loss
+            terminals = mb_terminals.bool()
+            truncations = mb_truncations.bool()
+            terminals_shifted = torch.cat([torch.zeros_like(terminals[:, :1]), terminals[:, :-1]],dim=1)
+            invalid_mb_mask = terminals & terminals_shifted # this happens, if goal_behavior=2 or =3, these steps should not be valid anymore.
+            invalid_mb_mask = invalid_mb_mask | truncations # at the truncation step, we do not have the next state and therefore no approximation of V(s_t+1)
+            invalid_mb_obs = (mb_obs[:, -1, 0] == -1000) # invalid observation due to delay in workers (sync_get_observation function)
+            invalid_mb_mask[:, -1] = invalid_mb_mask[:, -1] | invalid_mb_obs
 
-            # Losses
+            terminals_shifted_left = torch.cat([terminals[:, 1:], torch.ones_like(terminals[:, :1])],dim=1)
+            invalid_terminals = ~terminals_shifted_left & terminals & ~truncations # terminals shifted illegally from 1 to 0 without truncation, then the above terminal_mask calculation is not valid anymore!
+
+            # avoiding a dilution, if most of the batch is after terminals
+            adv = mb_advantages
+            mb_prio = mb_prio / (mb_prio.max() + 1e-8) 
+
             pg_loss1 = -adv * ratio
             pg_loss2 = -adv * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-            pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+
+            pg_loss_individual = torch.max(pg_loss1, pg_loss2)
+            pg_loss = (pg_loss_individual * (~invalid_mb_mask) * mb_prio).sum() / ((~invalid_mb_mask)*mb_prio).sum()
 
             newvalue = newvalue.view(mb_returns.shape)
-            v_clipped = mb_values + torch.clamp(newvalue - mb_values, -vf_clip, vf_clip)
+            v_clipped = mb_values[:, :-1] + torch.clamp(newvalue - mb_values[:, :-1], -vf_clip, vf_clip)
             v_loss_unclipped = (newvalue - mb_returns) ** 2
             v_loss_clipped = (v_clipped - mb_returns) ** 2
-            v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+            v_loss_individual = torch.max(v_loss_unclipped, v_loss_clipped)
+            v_loss = ((0.5 * (v_loss_individual * (~invalid_mb_mask)))*mb_prio).sum() / ((~invalid_mb_mask)*mb_prio).sum()
 
-            entropy_loss = entropy.mean()
+            entropy = entropy.reshape(mb_terminals.shape)
+            entropy_loss = (entropy * (~invalid_mb_mask)).sum() / (~invalid_mb_mask).sum()
 
-            # Get current entropy coefficient
-            if config["anneal_entropy"]:
-                # Cosine annealing from initial to 0.0
-                current_ent_coef = 0.5 * self.ent_coef_initial * (1 + np.cos(np.pi * self.epoch / self.total_epochs))
-            else:
-                current_ent_coef = config["ent_coef"]
-
-            loss = pg_loss + config["vf_coef"] * v_loss - current_ent_coef * entropy_loss
-
+            loss = pg_loss + config["vf_coef"] * v_loss - config["ent_coef"] * entropy_loss
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
-            self.values[idx] = newvalue.detach().float()
+            self.values[idx, :-1] = newvalue.detach().float()
+            # TODO: check that the right hidden state is taken here from before!
+            _, last_newvalue = self.policy(mb_obs[:, -1:], state, mb_truncations[:, -1:], episode_ended=True)
+            self.values[idx, -1:] = last_newvalue.detach().float() 
 
             # Logging
             profile("train_misc", epoch)
@@ -493,8 +603,8 @@ class PuffeRL:
         if config["anneal_lr"]:
             self.scheduler.step()
 
-        y_pred = self.values.flatten()
-        y_true = advantages.flatten() + self.values.flatten()
+        y_pred = self.values[:, :-1].flatten()
+        y_true = advantages.flatten() + self.values[:, :-1].flatten()
         var_y = y_true.var()
         explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
         losses["explained_variance"] = explained_var.item()
@@ -516,28 +626,43 @@ class PuffeRL:
             self.save_checkpoint()
             self.msg = f"Checkpoint saved at update {self.epoch}"
 
-        if (self.epoch - 1) % self.config["eval"]["eval_interval"] == 0 or done_training:
-            human_replay_eval = self.config["eval"]["human_replay_eval"]
-            self_play_eval = self.config["eval"]["self_play_eval"]
+            if self.render and self.epoch % self.render_interval == 0:
+                model_dir = os.path.join(self.config["data_dir"], f"{self.config['env']}_{self.logger.run_id}")
+                model_files = glob.glob(os.path.join(model_dir, "model_*.pt"))
 
-            self.evaluator = Evaluator(self.full_args, self.logger)
-            if human_replay_eval:
-                self.evaluator.hr_env = load_env("puffer_drive", self.evaluator.hr_eval_config)
-                self.evaluator.rollout(self.uncompiled_policy, mode="human_replay")
-                self.evaluator.hr_env.close()
-                self.evaluator.log_videos(eval_mode="human_replay", epoch=self.epoch)
-            if self_play_eval:
-                self.evaluator.sp_env = load_env("puffer_drive", self.evaluator.sp_eval_config)
-                self.evaluator.rollout(self.uncompiled_policy, mode="self_play")
-                self.evaluator.sp_env.close()
-                self.evaluator.log_videos(eval_mode="self_play", epoch=self.epoch)
-            if human_replay_eval or self_play_eval:
-                self.evaluator.log_stats()
+                if model_files:
+                    # Take the latest checkpoint
+                    latest_cpt = max(model_files, key=os.path.getctime)
+                    bin_path = f"{model_dir}.bin"
 
-            del self.evaluator
+                    # Export to .bin for rendering with raylib
+                    try:
+                        export_args = {"env_name": self.config["env"], "load_model_path": latest_cpt, **self.config}
 
-        if self.config["eval"]["wosac_realism_eval"]:
+                        export(
+                            args=export_args,
+                            env_name=self.config["env"],
+                            vecenv=self.vecenv,
+                            policy=self.uncompiled_policy,
+                            path=bin_path,
+                            silent=True,
+                        )
+                        pufferlib.utils.render_videos(
+                            self.config, self.vecenv, self.logger, self.epoch, self.global_step, bin_path
+                        )
+
+                    except Exception as e:
+                        print(f"Failed to export model weights: {e}")
+
+        if self.config["eval"]["wosac_realism_eval"] and (
+            self.epoch % self.config["eval"]["eval_interval"] == 0 or done_training
+        ):
             pufferlib.utils.run_wosac_eval_in_subprocess(self.config, self.logger, self.global_step)
+
+        if self.config["eval"]["human_replay_eval"] and (
+            self.epoch % self.config["eval"]["eval_interval"] == 0 or done_training
+        ):
+            pufferlib.utils.run_human_replay_eval_in_subprocess(self.config, self.logger, self.global_step)
 
     def mean_and_log(self):
         config = self.config
@@ -558,14 +683,12 @@ class PuffeRL:
             "uptime": time.time() - self.start_time,
             "epoch": int(dist_sum(self.epoch, device)),
             "learning_rate": self.optimizer.param_groups[0]["lr"],
-            "ent_coef": (
-                0.5 * self.ent_coef_initial * (1 + np.cos(np.pi * self.epoch / self.total_epochs))
-                if config["anneal_entropy"]
-                else config["ent_coef"]
-            ),
             **{f"environment/{k}": v for k, v in self.stats.items()},
             **{f"losses/{k}": v for k, v in self.losses.items()},
             **{f"performance/{k}": v["elapsed"] for k, v in self.profile},
+            # **{f'environment/{k}': dist_mean(v, device) for k, v in self.stats.items()},
+            # **{f'losses/{k}': dist_mean(v, device) for k, v in self.losses.items()},
+            # **{f'performance/{k}': dist_sum(v['elapsed'], device) for k, v in self.profile},
         }
 
         if torch.distributed.is_initialized():
@@ -726,7 +849,7 @@ class PuffeRL:
 
 
 def compute_puff_advantage(
-    values, rewards, terminals, ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip
+    values, rewards, terminals, truncations, ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip
 ):
     """CUDA kernel for puffer advantage with automatic CPU fallback. You need
     nvcc (in cuda-dev-tools or in a cuda-dev docker base) for PufferLib to
@@ -739,9 +862,10 @@ def compute_puff_advantage(
         terminals = terminals.cpu()
         ratio = ratio.cpu()
         advantages = advantages.cpu()
+        truncations = truncations.cpu()
 
     torch.ops.pufferlib.compute_puff_advantage(
-        values, rewards, terminals, ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip
+        values, rewards, terminals, truncations, ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip
     )
 
     if not ADVANTAGE_CUDA:
@@ -975,6 +1099,7 @@ class WandbLogger:
 
 def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     args = args or load_config(env_name)
+    args["env"]["split"] = "training"
 
     # Assume TorchRun DDP is used if LOCAL_RANK is set
     if "LOCAL_RANK" in os.environ:
@@ -1008,7 +1133,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         logger = WandbLogger(args)
 
     train_config = dict(**args["train"], env=env_name, eval=args.get("eval", {}))
-    pufferl = PuffeRL(train_config, vecenv, policy, logger, full_args=args)
+    pufferl = PuffeRL(train_config, vecenv, policy, logger)
 
     all_logs = []
     while pufferl.global_step < train_config["total_timesteps"]:
@@ -1046,22 +1171,24 @@ def eval(env_name, args=None, vecenv=None, policy=None):
     """Evaluate a policy."""
 
     args = args or load_config(env_name)
-    args["env"]["termination_mode"] = 0
 
     wosac_enabled = args["eval"]["wosac_realism_eval"]
     human_replay_enabled = args["eval"]["human_replay_eval"]
+    #args["env"]["map_dir"] = args["eval"]["map_dir"]
+    #dataset_name = args["env"]["map_dir"].split("/")[-1]
+    args["env"]["num_maps"] = args["eval"]["num_maps"]
+    args["env"]["use_all_maps"] = True
+
+    args["env"]["split"] = args["eval"]["split"]
+    dataset_name = args["eval"]["split"]
+
 
     if wosac_enabled:
-        args["env"]["map_dir"] = args["eval"]["map_dir"]
-        dataset_name = args["env"]["map_dir"].split("/")[-1]
-
-        print(f"Running WOSAC realism evaluation with {dataset_name} dataset.\n")
+        print(f"Running WOSAC realism evaluation with {dataset_name} dataset. \n")
         from pufferlib.ocean.benchmark.evaluator import WOSACEvaluator
 
         backend = args["eval"]["backend"]
         assert backend == "PufferEnv" or not wosac_enabled, "WOSAC evaluation only supports PufferEnv backend."
-
-        # Configure environment for WOSAC
         args["vec"] = dict(backend=backend, num_envs=1)
         args["env"]["init_mode"] = args["eval"]["wosac_init_mode"]
         args["env"]["control_mode"] = args["eval"]["wosac_control_mode"]
@@ -1069,52 +1196,87 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         args["env"]["goal_behavior"] = args["eval"]["wosac_goal_behavior"]
         args["env"]["goal_radius"] = args["eval"]["wosac_goal_radius"]
 
-        # Batch size configuration
-        num_scenes_per_batch = args["eval"]["wosac_batch_size"]
-        args["env"]["num_agents"] = num_scenes_per_batch * 10
-        args["env"]["num_maps"] = args["eval"]["wosac_scenario_pool_size"]
-
-        # Create environment and policy
         vecenv = vecenv or load_env(env_name, args)
         policy = policy or load_policy(args, vecenv, env_name)
 
-        # Make eval class instance
         evaluator = WOSACEvaluator(args)
 
-        # Obtain scores
-        df_results = evaluator.evaluate(args, vecenv, policy)
+        # Collect ground truth trajectories from the dataset
+        gt_trajectories = evaluator.collect_ground_truth_trajectories(vecenv)
 
-        # Average results over scenarios
-        results_dict = df_results.mean().to_dict()
-        results_dict["total_num_agents"] = df_results["num_agents_per_scene"].sum()
-        results_dict["total_unique_scenarios"] = df_results.index.unique().shape[0]
-        results_dict["realism_meta_score_std"] = df_results["realism_meta_score"].std()
-        results_dict = {k: v.item() if hasattr(v, "item") else v for k, v in results_dict.items()}
+        print(f"Number of scenarios: {len(np.unique(gt_trajectories['scenario_id']))}")
+        print(f"Number of controlled agents: {gt_trajectories['x'].shape[0]}")
+        print(f"Number of evaluated agents: {np.sum(gt_trajectories['id'] >= 0)}")
+
+        # Roll out trained policy in the simulator
+        simulated_trajectories = evaluator.collect_simulated_trajectories(args, vecenv, policy)
+
+        if args["eval"]["wosac_sanity_check"]:
+            evaluator._quick_sanity_check(gt_trajectories, simulated_trajectories)
+
+        # Analyze and compute metrics
+        agent_state = vecenv.driver_env.get_global_agent_state()
+        road_edge_polylines = vecenv.driver_env.get_road_edge_polylines()
+        results = evaluator.compute_metrics(
+            gt_trajectories,
+            simulated_trajectories,
+            agent_state,
+            road_edge_polylines,
+            args["eval"]["wosac_aggregate_results"],
+        )
+
+        if args["eval"]["wosac_aggregate_results"]:
+            import json
+
+            print("\nWOSAC_METRICS_START")
+            print(json.dumps(results))
+            print("WOSAC_METRICS_END")
+
+        return results
+
+    elif human_replay_enabled:
+        print(f"Running human replay evaluation with {dataset_name} dataset.\n")
+        from pufferlib.ocean.benchmark.evaluator import HumanReplayEvaluator
+
+        backend = args["eval"].get("backend", "PufferEnv")
+        args["vec"] = dict(backend=backend, num_envs=1)
+        args["env"]["control_mode"] = args["eval"]["human_replay_control_mode"]
+        args["env"]["episode_length"] = 91  # WOMD scenario length
+
+        vecenv = vecenv or load_env(env_name, args)
+        policy = policy or load_policy(args, vecenv, env_name)
+
+        print(f"Effective number of scenarios used: {len(vecenv.driver_env.agent_offsets) - 1}")
+
+        evaluator = HumanReplayEvaluator(args)
+
+        # Run rollouts with human replays
+        results = evaluator.rollout(args, vecenv, policy)
 
         import json
 
-        print("\nWOSAC_METRICS_START")
-        print(json.dumps(results_dict))
-        print("WOSAC_METRICS_END")
-        vecenv.close()
-        return results_dict
+        print("HUMAN_REPLAY_METRICS_START")
+        print(json.dumps(results))
+        print("HUMAN_REPLAY_METRICS_END")
 
+        return results
     else:  # Standard evaluation: Render
         backend = args["vec"]["backend"]
         if backend != "PufferEnv":
             backend = "Serial"
 
         args["vec"] = dict(backend=backend, num_envs=1)
-
-        # Create environment and policy
         vecenv = vecenv or load_env(env_name, args)
         policy = policy or load_policy(args, vecenv, env_name)
 
-        # Reset environment
         ob, info = vecenv.reset()
         driver = vecenv.driver_env
         num_agents = vecenv.observation_space.shape[0]
         device = args["train"]["device"]
+
+        # Rebuild visualize binary if saving frames (for C-based rendering)
+        if args["save_frames"] > 0:
+            ensure_drive_binary()
 
         state = {}
         if args["train"]["use_rnn"]:
@@ -1123,12 +1285,23 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
             )
 
-        if driver.render_mode == 1:
-            max_frames = 91
-            frame_count = 0
-
+        frames = []
         while True:
-            driver.render()
+            render = driver.render()
+            if len(frames) < args["save_frames"]:
+                frames.append(render)
+
+            # Screenshot Ocean envs with F12, gifs with control + F12
+            if driver.render_mode == "ansi":
+                print("\033[0;0H" + render + "\n")
+                time.sleep(1 / args["fps"])
+            elif driver.render_mode == "rgb_array":
+                pass
+                # import cv2
+                # render = cv2.cvtColor(render, cv2.COLOR_RGB2BGR)
+                # cv2.imshow('frame', render)
+                # cv2.waitKey(1)
+                # time.sleep(1/args['fps'])
 
             with torch.no_grad():
                 ob = torch.as_tensor(ob).to(device)
@@ -1139,14 +1312,13 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             if isinstance(logits, torch.distributions.Normal):
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
-            ob, reward, done, truncated, info = vecenv.step(action)
+            ob = vecenv.step(action)[0]
 
-            if driver.render_mode == 1:
-                frame_count += 1
-                if frame_count >= max_frames or done.all() or truncated.all():
-                    break
+            if len(frames) > 0 and len(frames) == args["save_frames"]:
+                import imageio
 
-        vecenv.close()
+                imageio.mimsave(args["gif_path"], frames, fps=args["fps"], loop=0)
+                frames.append("Done")
 
 
 def sweep(args=None, env_name=None):
@@ -1334,6 +1506,27 @@ def export(args=None, env_name=None, vecenv=None, policy=None, path=None, silent
 
     if not silent:
         print(f"Saved {len(weights)} weights to {path}")
+
+
+def ensure_drive_binary():
+    """Delete existing visualize binary and rebuild it. This ensures the
+    binary is always up-to-date with the latest code changes.
+    """
+    if os.path.exists("./visualize"):
+        os.remove("./visualize")
+
+    try:
+        result = subprocess.run(
+            ["bash", "scripts/build_ocean.sh", "visualize", "local"], capture_output=True, text=True, timeout=300
+        )
+
+        if result.returncode != 0:
+            print(f"Build failed: {result.stderr}")
+            raise RuntimeError("Failed to build visualize binary for rendering")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Build timed out")
+    except Exception as e:
+        raise RuntimeError(f"Build error: {e}")
 
 
 def autotune(args=None, env_name=None, vecenv=None, policy=None):

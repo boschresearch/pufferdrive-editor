@@ -1,25 +1,31 @@
+# Copyright (c) 2026 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+# Copyright (c) PufferDrive authors, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 import numpy as np
 import gymnasium
 import json
 import struct
 import os
 import pufferlib
-from enum import IntEnum
+from pathlib import Path
 from pufferlib.ocean.drive import binding
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
-
-class RenderView(IntEnum):
-    FULL_SIM_STATE = 0  # Orthographic top-down, fully observable simulator state
-    BEV_AGENT_OBS = 1  # Orthographic top-down, only show what the selected agent can observe
-    AGENT_PERSP = 2  # Third-person perspective following selected agent
+_DRIVE_INI = str(Path(__file__).parent.parent.parent / "config" / "ocean" / "drive.ini")
 
 
 class Drive(pufferlib.PufferEnv):
     def __init__(
         self,
-        render_mode=RenderView.FULL_SIM_STATE,
+        data_root=None,
+        split="training",
+        render_mode=None,
         report_interval=1,
         width=1280,
         height=1024,
@@ -42,13 +48,15 @@ class Drive(pufferlib.PufferEnv):
         num_agents=512,
         action_type="discrete",
         dynamics_model="classic",
+        max_controlled_agents=-1,
         buf=None,
         seed=1,
         init_steps=0,
         init_mode="create_all_valid",
         control_mode="control_vehicles",
-        max_controlled_agents=32,
-        map_dir="resources/drive/binaries/training",
+        #map_dir="resources/drive/binaries/training",
+        use_all_maps=False,
+        map_id=None,
     ):
         # env
         self.dt = dt
@@ -70,7 +78,6 @@ class Drive(pufferlib.PufferEnv):
         self.termination_mode = termination_mode
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
-        self.max_controlled_agents = max_controlled_agents
 
         # Observation space calculation
         self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}.get(
@@ -90,11 +97,16 @@ class Drive(pufferlib.PufferEnv):
             + self.max_road_objects * self.road_features
         )
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
-
+        
+        if data_root == None:
+            if 'DRIVE_BINARIES_DATA_ROOT' in os.environ:
+                data_root = os.environ['DRIVE_BINARIES_DATA_ROOT']
+            else:
+                raise ValueError(f"data_root is not specified and environment variable DRIVE_BINARIES_DATA_ROOT is not set")
         self.init_steps = init_steps
         self.init_mode_str = init_mode
         self.control_mode_str = control_mode
-        self.map_dir = map_dir
+        #self.map_dir = map_dir
 
         if self.control_mode_str == "control_vehicles":
             self.control_mode = 0
@@ -104,11 +116,9 @@ class Drive(pufferlib.PufferEnv):
             self.control_mode = 2
         elif self.control_mode_str == "control_sdc_only":
             self.control_mode = 3
-        elif self.control_mode_str == "control_mixed_play":
-            self.control_mode = 4
         else:
             raise ValueError(
-                f"control_mode must be one of 'control_vehicles', 'control_wosac', 'control_agents' or 'control_mixed_play'. Got: {self.control_mode_str}"
+                f"control_mode must be one of 'control_vehicles', 'control_wosac', or 'control_agents'. Got: {self.control_mode_str}"
             )
         if self.init_mode_str == "create_all_valid":
             self.init_mode = 0
@@ -119,6 +129,14 @@ class Drive(pufferlib.PufferEnv):
                 f"init_mode must be one of 'create_all_valid' or 'create_only_controlled'. Got: {self.init_mode_str}"
             )
 
+        
+        self.data_root = data_root
+
+        assert split in ["training", "validation", "testing"], f"Passed parameter 'split' must be 'training', 'validation' or 'testing'. Got: {split}"
+
+        self.split = split
+
+        
         if action_type == "discrete":
             if dynamics_model == "classic":
                 # Joint action space (assume dependence)
@@ -138,38 +156,51 @@ class Drive(pufferlib.PufferEnv):
         self._action_type_flag = 0 if action_type == "discrete" else 1
 
         # Check if resources directory exists
-        binary_path = f"{map_dir}/map_000.bin"
+        # binary_path = "resources/drive/binaries/map_000.bin"
+        binary_path = os.path.join(data_root, split, "map_000000.bin")
         if not os.path.exists(binary_path):
             raise FileNotFoundError(
                 f"Required directory {binary_path} not found. Please ensure the Drive maps are downloaded and installed correctly per docs."
             )
 
         # Check maps availability
-        available_maps = len([name for name in os.listdir(map_dir) if name.endswith(".bin")])
+        # available_maps = len([name for name in os.listdir("resources/drive/binaries") if name.endswith(".bin")])
+        available_maps = len([name for name in os.listdir(os.path.join(data_root, split)) if name.endswith(".bin")])
         if num_maps > available_maps:
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
+        self.max_controlled_agents = int(max_controlled_agents)
 
-        # Iterate through all maps to count total agents that can be initialized for each map
-        agent_offsets, map_ids, num_envs = binding.shared(
-            map_dir=map_dir,
-            num_agents=num_agents,
-            num_maps=num_maps,
-            init_mode=self.init_mode,
-            control_mode=self.control_mode,
-            init_steps=self.init_steps,
-            goal_behavior=self.goal_behavior,
-            goal_target_distance=self.goal_target_distance,
-            max_controlled_agents=self.max_controlled_agents,
-        )
+        if map_id is not None:
+            # Single-map viewer mode: skip binding.shared() and pin to the requested map.
+            agent_offsets = [0, num_agents]
+            map_ids = [map_id]
+            num_envs = 1
+        else:
+            # Iterate through all maps to count total agents that can be initialized for each map
+            agent_offsets, map_ids, num_envs = binding.shared(
+                #map_dir=map_dir,
+                num_agents=num_agents,
+                num_maps=num_maps,
+                split=split,
+                data_root=data_root,
+                init_mode=self.init_mode,
+                control_mode=self.control_mode,
+                init_steps=self.init_steps,
+                max_controlled_agents=self.max_controlled_agents,
+                goal_behavior=self.goal_behavior,
+                goal_target_distance=self.goal_target_distance,
+                use_all_maps=use_all_maps,
+            )
 
-        self.num_agents = agent_offsets[-1]
+        # agent_offsets[-1] works in both cases, just making it explicit that num_agents is ignored if use_all_maps
+        self.num_agents = num_agents if not use_all_maps else agent_offsets[-1]
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
         super().__init__(buf=buf)
-        self.env_ids = []
+        env_ids = []
         for i in range(num_envs):
             cur = agent_offsets[i]
             nxt = agent_offsets[i + 1]
@@ -195,110 +226,125 @@ class Drive(pufferlib.PufferEnv):
                 dt=dt,
                 episode_length=(int(episode_length) if episode_length is not None else None),
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
+                max_controlled_agents=self.max_controlled_agents,
                 map_id=map_ids[i],
                 max_agents=nxt - cur,
-                ini_file="pufferlib/config/ocean/drive.ini",
+                ini_file=_DRIVE_INI,
                 init_steps=init_steps,
                 init_mode=self.init_mode,
                 control_mode=self.control_mode,
-                map_dir=map_dir,
-                max_controlled_agents=self.max_controlled_agents,
-                render_mode=render_mode,
-            )
-            self.env_ids.append(env_id)
 
-        self.c_envs = binding.vectorize(*self.env_ids)
+                data_root=self.data_root,
+                split=split,
+
+                #map_dir=self.map_dir,
+
+            )
+            env_ids.append(env_id)
+
+        self.c_envs = binding.vectorize(*env_ids)
 
     def reset(self, seed=0):
         binding.vec_reset(self.c_envs, seed)
         self.tick = 0
-        self.truncations[:] = 0
         return self.observations, []
 
-    def resample_maps(self):
-        """Resample environment maps."""
-        self.tick = 0
-        binding.vec_close(self.c_envs)
-        agent_offsets, map_ids, num_envs = binding.shared(
-            num_agents=self.num_agents,
-            num_maps=self.num_maps,
-            init_mode=self.init_mode,
-            control_mode=self.control_mode,
-            init_steps=self.init_steps,
-            goal_behavior=self.goal_behavior,
-            goal_target_distance=self.goal_target_distance,
-            goal_speed=self.goal_speed,
-            map_dir=self.map_dir,
-            max_controlled_agents=self.max_controlled_agents,
-        )
-        self.agent_offsets = agent_offsets
-        self.map_ids = map_ids
-        self.num_envs = num_envs
-        self.env_ids = []
-        seed = np.random.randint(0, 2**32 - 1)
-        for i in range(num_envs):
-            cur = agent_offsets[i]
-            nxt = agent_offsets[i + 1]
-            env_id = binding.env_init(
-                self.observations[cur:nxt],
-                self.actions[cur:nxt],
-                self.rewards[cur:nxt],
-                self.terminals[cur:nxt],
-                self.truncations[cur:nxt],
-                seed,
-                action_type=self._action_type_flag,
-                human_agent_idx=self.human_agent_idx,
-                reward_vehicle_collision=self.reward_vehicle_collision,
-                reward_offroad_collision=self.reward_offroad_collision,
-                reward_goal=self.reward_goal,
-                reward_goal_post_respawn=self.reward_goal_post_respawn,
-                goal_radius=self.goal_radius,
-                goal_behavior=self.goal_behavior,
-                goal_target_distance=self.goal_target_distance,
-                goal_speed=self.goal_speed,
-                collision_behavior=self.collision_behavior,
-                offroad_behavior=self.offroad_behavior,
-                dt=self.dt,
-                episode_length=(int(self.episode_length) if self.episode_length is not None else None),
-                map_id=map_ids[i],
-                max_agents=nxt - cur,
-                ini_file="pufferlib/config/ocean/drive.ini",
-                init_steps=self.init_steps,
-                init_mode=self.init_mode,
-                control_mode=self.control_mode,
-                map_dir=self.map_dir,
-                termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
-                max_controlled_agents=self.max_controlled_agents,
-                render_mode=self.render_mode,
-            )
-            self.env_ids.append(env_id)
-        self.c_envs = binding.vectorize(*self.env_ids)
-
-        binding.vec_reset(self.c_envs, seed)
-        self.terminals[:] = 1
-        self.truncations[:] = 1
-
-    def step(self, actions, per_env_logs=False):
+    def step(self, actions):
+        
         self.terminals[:] = 0
         self.truncations[:] = 0
         self.actions[:] = actions
-        binding.vec_step(self.c_envs)
-        self.tick += 1
-        info = []
-        if self.tick % self.report_interval == 0:
-            if per_env_logs:  # Get the stats for every separate env
-                logs = self.get_env_logs()
-                if any(logs):
-                    info = logs
-            else:  # Default: Aggregate across vectorized envs
+        # reset environment, if resample_frequency is reached, you do not need to step in this case!
+        if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
+            self.tick = 0
+            binding.vec_close(self.c_envs)
+            agent_offsets, map_ids, num_envs = binding.shared(
+                num_agents=self.num_agents,
+                num_maps=self.num_maps,
+                init_mode=self.init_mode,
+                control_mode=self.control_mode,
+                init_steps=self.init_steps,
+                max_controlled_agents=self.max_controlled_agents,
+                goal_behavior=self.goal_behavior,
+                goal_target_distance=self.goal_target_distance,
+                goal_speed=self.goal_speed,
+                split=self.split, 
+                data_root=self.data_root,
+
+                #map_dir=self.map_dir,
+                use_all_maps=False,
+            )
+            self.agent_offsets = agent_offsets
+            self.map_ids = map_ids
+            self.num_envs = num_envs
+            env_ids = []
+            seed = np.random.randint(0, 2**32 - 1)
+            for i in range(num_envs):
+                cur = agent_offsets[i]
+                nxt = agent_offsets[i + 1]
+                env_id = binding.env_init(
+                    self.observations[cur:nxt],
+                    self.actions[cur:nxt],
+                    self.rewards[cur:nxt],
+                    self.terminals[cur:nxt],
+                    self.truncations[cur:nxt],
+                    seed,
+                    action_type=self._action_type_flag,
+                    human_agent_idx=self.human_agent_idx,
+                    reward_vehicle_collision=self.reward_vehicle_collision,
+                    reward_offroad_collision=self.reward_offroad_collision,
+                    reward_goal=self.reward_goal,
+                    reward_goal_post_respawn=self.reward_goal_post_respawn,
+                    goal_radius=self.goal_radius,
+                    goal_behavior=self.goal_behavior,
+                    goal_target_distance=self.goal_target_distance,
+                    goal_speed=self.goal_speed,
+                    collision_behavior=self.collision_behavior,
+                    offroad_behavior=self.offroad_behavior,
+                    dt=self.dt,
+                    episode_length=(int(self.episode_length) if self.episode_length is not None else None),
+                    max_controlled_agents=self.max_controlled_agents,
+                    map_id=map_ids[i],
+                    max_agents=nxt - cur,
+                    ini_file=_DRIVE_INI,
+                    init_steps=self.init_steps,
+                    init_mode=self.init_mode,
+                    control_mode=self.control_mode,
+                    data_root=self.data_root,
+                    split=self.split,
+
+                    #map_dir=self.map_dir,
+                )
+                env_ids.append(env_id)
+            self.c_envs = binding.vectorize(*env_ids)
+
+            binding.vec_reset(self.c_envs, seed)
+            info = []
+        
+        else:
+            binding.vec_step(self.c_envs) # truncations and terminals get set in here as well.
+            self.tick += 1
+            info = []
+            if self.tick % self.report_interval == 0:
                 log = binding.vec_log(self.c_envs, self.num_agents)
                 if log:
                     info.append(log)
+                    # print(log)
+            if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0: # self.tick just got increased!
+                self.truncations[:] = 1.0 # truncations are the ones which are after time out right??
 
-        if self.tick > 0 and self.resample_frequency > 0 and self.tick % self.resample_frequency == 0:
-            self.resample_maps()
+            
 
         return (self.observations, self.rewards, self.terminals, self.truncations, info)
+
+    def set_goals(self, goal_changes: dict):
+        """Set goal positions for agents.
+
+        Args:
+            goal_changes: {entity_idx: (goal_x, goal_y)} in world coordinates
+        """
+        binding.vec_set_goals(self.c_envs, goal_changes=goal_changes)
+        binding.vec_recompute_observations(self.c_envs)
 
     def get_global_agent_state(self):
         """Get current global state of all active agents.
@@ -332,6 +378,184 @@ class Drive(pufferlib.PufferEnv):
 
         return states
 
+    def get_active_agent_count(self) -> int:
+        return binding.vec_get_active_agent_count(self.c_envs)
+
+    def inject_active_agent(self, x: float, y: float, heading: float,
+                            goal_x: float, goal_y: float, env_idx: int = 0) -> bool:
+        """Hijack an inactive vehicle slot to add a new policy-controlled agent.
+
+        Call after reset() and before the first step(). Returns True on success.
+        The injection is discarded on the next reset().
+        """
+        rc = binding.vec_inject_active_agent(
+            self.c_envs, x=float(x), y=float(y), heading=float(heading),
+            goal_x=float(goal_x), goal_y=float(goal_y), env_idx=int(env_idx),
+        )
+        return rc == 1
+
+    def inject_static_agent(self, x: float, y: float, heading: float, env_idx: int = 0) -> bool:
+        """Place a non-moving vehicle at the given world position and heading.
+
+        Call after reset() and before the first step(). Returns True on success.
+        """
+        rc = binding.vec_inject_static_agent(
+            self.c_envs, x=float(x), y=float(y), heading=float(heading), env_idx=int(env_idx),
+        )
+        return rc == 1
+
+    def teleport_agent(self, active_slot: int, x: float, y: float,
+                       heading: float, goal_x: float, goal_y: float):
+        binding.vec_teleport_agent(self.c_envs, 0, active_slot,
+                                   float(x), float(y), float(heading),
+                                   float(goal_x), float(goal_y))
+
+    def teleport_static_agent(self, nonexpert_idx: int, x: float, y: float,
+                              heading: float, env_idx: int = 0):
+        """Reposition a non-expert static agent in place, keeping its slot/identity.
+        nonexpert_idx is the index in the non-expert static order (matches
+        get_static_agent_state / detach_static_agent)."""
+        binding.vec_teleport_static_agent(self.c_envs, int(env_idx), int(nonexpert_idx),
+                                          float(x), float(y), float(heading))
+
+    def teleport_expert_agent(self, expert_idx: int, world_xs, world_ys, headings, env_idx: int = 0):
+        """Reposition an expert agent in place by replacing its trajectory, keeping its slot.
+        expert_idx is the index in the expert order (matches detach_expert_agent)."""
+        import numpy as np
+        xs = np.asarray(world_xs, dtype=np.float32)
+        ys = np.asarray(world_ys, dtype=np.float32)
+        hs = np.asarray(headings, dtype=np.float32)
+        binding.vec_teleport_expert_agent(
+            self.c_envs, expert_idx=int(expert_idx), xs=xs, ys=ys, headings=hs, env_idx=int(env_idx),
+        )
+
+    def reset_injections(self):
+        """Restore agent counts to original post-init values before re-injecting."""
+        binding.vec_reset_injections(self.c_envs)
+
+    def prepare_reserved_slots(self):
+        """Pre-park N spare vehicles at (-9000,-9000) to guarantee injection slots exist."""
+        binding.vec_prepare_reserved_slots(self.c_envs)
+
+    def detach_active_agent(self, slot_idx: int, env_idx: int = 0):
+        """Remove an active agent from the pool (frees a slot for demo injection in full scenes).
+        Pass slot indices in descending order when calling multiple times."""
+        binding.vec_detach_active_agent(self.c_envs, int(env_idx), int(slot_idx))
+
+    def detach_static_agent(self, slot_idx: int, env_idx: int = 0):
+        """Remove a non-expert static agent from the pool (frees a slot for demo injection).
+        Pass slot indices in descending order when calling multiple times."""
+        binding.vec_detach_static_agent(self.c_envs, int(env_idx), int(slot_idx))
+
+    def detach_expert_agent(self, slot_idx: int, env_idx: int = 0):
+        """Remove an expert static agent from the pool (frees a slot for demo injection).
+        Pass slot indices in descending order when calling multiple times."""
+        binding.vec_detach_expert_agent(self.c_envs, int(env_idx), int(slot_idx))
+
+    def prepare_demo_slots(self):
+        """Allocate 10 ghost active + 10 ghost static demo slots permanently at INVALID_POSITION."""
+        binding.vec_prepare_demo_slots(self.c_envs)
+
+    def reset_demo_slots(self):
+        """Park all demo slots back to INVALID_POSITION before re-injecting user agents."""
+        binding.vec_reset_demo_slots(self.c_envs)
+
+    def inject_demo_active_agent(self, x: float, y: float, heading: float,
+                                  goal_x: float, goal_y: float, env_idx: int = 0,
+                                  length: float = 0.0, width: float = 0.0) -> int:
+        """Place a user dynamic agent in the first free demo active slot. Returns slot index or -1."""
+        return binding.vec_inject_demo_active_agent(
+            self.c_envs, x=float(x), y=float(y), heading=float(heading),
+            goal_x=float(goal_x), goal_y=float(goal_y), env_idx=int(env_idx),
+            length=float(length), width=float(width),
+        )
+
+    def inject_demo_static_agent(self, x: float, y: float, heading: float, env_idx: int = 0,
+                                  length: float = 0.0, width: float = 0.0) -> int:
+        """Place a user static agent in the first free demo static slot. Returns slot index or -1."""
+        return binding.vec_inject_demo_static_agent(
+            self.c_envs, x=float(x), y=float(y), heading=float(heading), env_idx=int(env_idx),
+            length=float(length), width=float(width),
+        )
+
+    def inject_demo_expert_agent(self, x: float, y: float, heading: float, env_idx: int = 0,
+                                  length: float = 0.0, width: float = 0.0) -> int:
+        """Place a user expert agent in the first free demo expert slot. Returns slot_k or -1."""
+        return binding.vec_inject_demo_expert_agent(
+            self.c_envs, x=float(x), y=float(y), heading=float(heading), env_idx=int(env_idx),
+            length=float(length), width=float(width),
+        )
+
+    def set_demo_expert_trajectory(self, slot_k: int, world_xs, world_ys, headings, env_idx: int = 0):
+        """Write a full trajectory into a demo expert slot. Arrays must be float32 numpy arrays."""
+        import numpy as np
+        xs = np.asarray(world_xs, dtype=np.float32)
+        ys = np.asarray(world_ys, dtype=np.float32)
+        hs = np.asarray(headings, dtype=np.float32)
+        binding.vec_set_demo_expert_traj(
+            self.c_envs, slot_k=int(slot_k), xs=xs, ys=ys, headings=hs, env_idx=int(env_idx),
+        )
+
+    def get_demo_slots_info(self, env_idx: int = 0) -> tuple[int, int]:
+        """Returns (used, total) for the shared demo slot pool."""
+        return binding.vec_get_demo_slots_info(self.c_envs, env_idx=int(env_idx))
+
+    def recompute_observations(self):
+        binding.vec_recompute_observations(self.c_envs)
+
+    def get_expert_agent_state(self):
+        """Get current state of expert (non-controlled) agents."""
+        n = binding.vec_get_expert_agent_count(self.c_envs)
+        if n == 0:
+            return {"x": np.zeros(0, dtype=np.float32), "y": np.zeros(0, dtype=np.float32),
+                    "heading": np.zeros(0, dtype=np.float32), "length": np.zeros(0, dtype=np.float32),
+                    "width": np.zeros(0, dtype=np.float32)}
+        states = {
+            "x":       np.zeros(n, dtype=np.float32),
+            "y":       np.zeros(n, dtype=np.float32),
+            "heading": np.zeros(n, dtype=np.float32),
+            "length":  np.zeros(n, dtype=np.float32),
+            "width":   np.zeros(n, dtype=np.float32),
+        }
+        binding.vec_get_expert_agent_state(self.c_envs, states["x"], states["y"],
+                                           states["heading"], states["length"], states["width"])
+        return states
+
+    def get_agent_statuses(self) -> np.ndarray:
+        """Return per-agent status codes as int32 array of shape (num_agents,).
+
+        Status codes (also exported as AGENT_STATUS_* constants in binding):
+          0 = Running      — active and moving
+          1 = Paused       — stopped (stopped=1, not removed)
+          2 = Crashed      — removed due to vehicle collision
+          3 = Offroad      — removed due to offroad collision
+          4 = Goal reached — current_goal_reached=1
+
+        Must be called immediately after env.step() for Crashed/Offroad to be
+        distinguishable — the underlying metrics reset at the start of the next step.
+        """
+        statuses = np.zeros(self.num_agents, dtype=np.int32)
+        binding.vec_get_agent_statuses(self.c_envs, statuses)
+        return statuses
+
+    def get_static_agent_state(self):
+        """Get initial state of static (parked) vehicles — non-controlled, non-expert agents."""
+        n = binding.vec_get_static_agent_count(self.c_envs)
+        if n == 0:
+            return {"x": np.zeros(0, dtype=np.float32), "y": np.zeros(0, dtype=np.float32),
+                    "heading": np.zeros(0, dtype=np.float32), "length": np.zeros(0, dtype=np.float32),
+                    "width": np.zeros(0, dtype=np.float32)}
+        states = {
+            "x":       np.zeros(n, dtype=np.float32),
+            "y":       np.zeros(n, dtype=np.float32),
+            "heading": np.zeros(n, dtype=np.float32),
+            "length":  np.zeros(n, dtype=np.float32),
+            "width":   np.zeros(n, dtype=np.float32),
+        }
+        binding.vec_get_static_agent_state(self.c_envs, states["x"], states["y"],
+                                           states["heading"], states["length"], states["width"])
+        return states
+
     def get_ground_truth_trajectories(self):
         """Get ground truth trajectories for all active agents.
 
@@ -347,9 +571,7 @@ class Drive(pufferlib.PufferEnv):
             "heading": np.zeros((num_agents, self.episode_length - self.init_steps), dtype=np.float32),
             "valid": np.zeros((num_agents, self.episode_length - self.init_steps), dtype=np.int32),
             "id": np.zeros(num_agents, dtype=np.int32),
-            "is_vehicle": np.zeros(num_agents, dtype=bool),
-            "is_track_to_predict": np.zeros(num_agents, dtype=bool),
-            "scenario_id": np.zeros(num_agents, dtype="S16"),
+            "scenario_id": np.zeros(num_agents, dtype=np.int32),
         }
 
         binding.vec_get_global_ground_truth_trajectories(
@@ -360,15 +582,11 @@ class Drive(pufferlib.PufferEnv):
             trajectories["heading"],
             trajectories["valid"],
             trajectories["id"],
-            trajectories["is_vehicle"],
-            trajectories["is_track_to_predict"],
             trajectories["scenario_id"],
         )
 
         for key in trajectories:
             trajectories[key] = trajectories[key][:, None]
-
-        trajectories["scenario_id"] = trajectories["scenario_id"].astype(str)
 
         return trajectories
 
@@ -385,7 +603,7 @@ class Drive(pufferlib.PufferEnv):
             "x": np.zeros(total_points, dtype=np.float32),
             "y": np.zeros(total_points, dtype=np.float32),
             "lengths": np.zeros(num_polylines, dtype=np.int32),
-            "scenario_id": np.zeros(num_polylines, dtype="S16"),
+            "scenario_id": np.zeros(num_polylines, dtype=np.int32),
         }
 
         binding.vec_get_road_edge_polylines(
@@ -396,29 +614,39 @@ class Drive(pufferlib.PufferEnv):
             polylines["scenario_id"],
         )
 
-        polylines["scenario_id"] = polylines["scenario_id"].astype(str)
+        return polylines
+
+    def get_lane_polylines(self):
+        """Get road lane polylines for all scenarios.
+
+        Returns:
+            dict with keys 'x', 'y', 'lengths', 'scenario_id' containing numpy arrays.
+            x, y are flattened point coordinates; lengths indicates points per polyline.
+        """
+        num_polylines, total_points = binding.vec_get_lane_counts(self.c_envs)
+
+        polylines = {
+            "x": np.zeros(total_points, dtype=np.float32),
+            "y": np.zeros(total_points, dtype=np.float32),
+            "lengths": np.zeros(num_polylines, dtype=np.int32),
+            "scenario_id": np.zeros(num_polylines, dtype=np.int32),
+        }
+
+        binding.vec_get_lane_polylines(
+            self.c_envs,
+            polylines["x"],
+            polylines["y"],
+            polylines["lengths"],
+            polylines["scenario_id"],
+        )
 
         return polylines
 
-    def render(self, view_mode: RenderView = RenderView.FULL_SIM_STATE, draw_traces: bool = True, env_id: int = 0):
-        binding.vec_render(self.c_envs, int(view_mode), draw_traces, env_id)
+    def render(self):
+        binding.vec_render(self.c_envs, 0)
 
     def close(self):
         binding.vec_close(self.c_envs)
-
-    def env_log(self, env_idx):
-        """Get log statistics for a single environment."""
-        num_agents = self.agent_offsets[env_idx + 1] - self.agent_offsets[env_idx]
-        return binding.env_log(self.env_ids[env_idx], num_agents)
-
-    def get_env_logs(self):
-        """Get log statistics for all environments (unaggregated)."""
-        return [self.env_log(i) for i in range(self.num_envs)]
-
-    @property
-    def scenario_ids(self) -> list[str]:
-        """Return scenario ID string for each env, stripping null padding."""
-        return [s.rstrip("\x00") for s in binding.vec_get_scenario_ids(self.c_envs)]
 
 
 def calculate_area(p1, p2, p3):
@@ -479,10 +707,6 @@ def save_map_binary(map_data, output_file, unique_map_id):
         metadata = map_data.get("metadata", {})
         sdc_track_index = metadata.get("sdc_track_index", -1)  # -1 as default if not found
         tracks_to_predict = metadata.get("tracks_to_predict", [])
-
-        # Write original scenario_id with fallback to placeholder
-        scenario_id = map_data.get("scenario_id", f"map_{unique_map_id:03d}")
-        f.write(struct.pack("16s", scenario_id.encode("utf-8")))
 
         # Write sdc_track_index
         f.write(struct.pack("i", sdc_track_index))
@@ -633,8 +857,9 @@ def _process_single_map(args):
 
 
 def process_all_maps(
-    data_folder="data/processed/training",
-    max_maps=50_000,
+    json_dir, 
+    binary_dir,
+    max_maps=10_000,
     num_workers=None,
 ):
     """Process all maps and save them as binaries using multiprocessing
@@ -646,24 +871,31 @@ def process_all_maps(
     """
     from pathlib import Path
 
+    # Create the binaries directory if it doesn't exist
+    # binary_dir = Path("resources/drive/binaries")
+    binary_dir.mkdir(parents=True, exist_ok=True)
+
     if num_workers is None:
         num_workers = cpu_count()
 
-    # Path to the training data
-    data_dir = Path(data_folder)
-    dataset_name = data_dir.name
+    # # Path to the training data
+    # data_dir = Path(data_folder)
+    # dataset_name = data_dir.name
 
-    # Create the binaries directory if it doesn't exist
-    binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
-    binary_dir.mkdir(parents=True, exist_ok=True)
+    # # Create the binaries directory if it doesn't exist
+    # binary_dir = Path(f"resources/drive/binaries/{dataset_name}")
+    # binary_dir.mkdir(parents=True, exist_ok=True)
 
     # Get all JSON files in the training directory
-    json_files = sorted(data_dir.glob("*.json"))
+    # json_files = sorted(data_dir.glob("*.json"))
+    json_files = sorted(json_dir.rglob("*.json"))
+
+    print(f"Found {len(json_files)} json files")
 
     # Prepare arguments for parallel processing
     tasks = []
     for i, map_path in enumerate(json_files[:max_maps]):
-        binary_file = f"map_{i:03d}.bin"
+        binary_file = f"map_{i:06d}.bin"  # Use zero-padded numbers for consistent sorting
         binary_path = binary_dir / binary_file
         tasks.append((i, map_path, binary_path))
 
@@ -716,9 +948,8 @@ def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
 
 if __name__ == "__main__":
     # test_performance()
-    # Process the train dataset
-    process_all_maps(data_folder="data/processed/training")
-    # Process the validation/test dataset
-    # process_all_maps(data_folder="data/processed/validation")
-    # # Process the validation_interactive dataset
-    # process_all_maps(data_folder="data/processed/validation_interactive")
+    # process_all_maps()
+    for split in ("training", "validation", "testing"):
+        cur_bin_dir = Path(os.path.join(os.environ['DRIVE_BINARIES_DATA_ROOT'], split))
+        cur_json_dir = Path(os.path.join(os.environ['DRIVE_DATA_ROOT'], split))
+        process_all_maps(cur_json_dir, cur_bin_dir,max_maps=10_000_000)

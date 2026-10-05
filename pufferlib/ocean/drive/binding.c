@@ -1,7 +1,23 @@
+// Copyright (c) 2026 Robert Bosch GmbH
+// SPDX-License-Identifier: AGPL-3.0
+
+// This source code is derived from PufferDrive V2.0
+// (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+// Copyright (c) PufferDrive authors, licensed under the MIT license,
+// cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
+#include <Python.h>
 #include "drive.h"
 #define Env Drive
 #define MY_SHARED
 #define MY_PUT
+
+// Forward declaration required before MY_METHODS macro expansion
+static PyObject* vec_set_goals(PyObject* self, PyObject* args, PyObject* kwargs);
+
+#define MY_METHODS \
+    {"vec_set_goals", (PyCFunction)vec_set_goals, METH_VARARGS | METH_KEYWORDS, "Set goal positions for entities"}
+
 #include "../env_binding.h"
 
 static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
@@ -64,74 +80,93 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
         return 1;
     }
     env->terminals = PyArray_DATA(terminals);
+
+    PyObject *trunc = PyDict_GetItemString(kwargs, "truncations");
+    if (!PyObject_TypeCheck(trunc, &PyArray_Type)) {
+        PyErr_SetString(PyExc_TypeError, "Truncations must be a NumPy array");
+        return 1;
+    }
+    PyArrayObject *truncations = (PyArrayObject *)trunc;
+    if (!PyArray_ISCONTIGUOUS(truncations)) {
+        PyErr_SetString(PyExc_ValueError, "Truncations must be contiguous");
+        return 1;
+    }
+    if (PyArray_NDIM(truncations) != 1) {
+        PyErr_SetString(PyExc_ValueError, "Truncations must be 1D");
+        return 1;
+    }
+    env->truncations = PyArray_DATA(truncations);
     return 0;
 }
 
-static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
-    char *map_dir = unpack_str(kwargs, "map_dir");
+static PyObject* my_shared(PyObject* self, PyObject* args, PyObject* kwargs) {
+    //char* map_dir = unpack_str(kwargs, "map_dir");
+    char* split = unpack_str(kwargs, "split");
+    char* data_root = unpack_str(kwargs, "data_root");
+
     int num_agents = unpack(kwargs, "num_agents");
     int num_maps = unpack(kwargs, "num_maps");
+
+    if (!data_root || !split) {
+        PyErr_SetString(PyExc_TypeError, "data_root and split must be set");
+        return NULL;
+    }
+    assert(data_root && split);
+
     int init_mode = unpack(kwargs, "init_mode");
     int control_mode = unpack(kwargs, "control_mode");
     int init_steps = unpack(kwargs, "init_steps");
     int goal_behavior = unpack(kwargs, "goal_behavior");
     float goal_target_distance = unpack(kwargs, "goal_target_distance");
-    int max_controlled_agents = unpack(kwargs, "max_controlled_agents");
-
+    int use_all_maps = unpack(kwargs, "use_all_maps");
     clock_gettime(CLOCK_REALTIME, &ts);
-    srand(ts.tv_nsec); // Always use random sampling with replacement
-
+    srand(ts.tv_nsec);
     int total_agent_count = 0;
     int env_count = 0;
-
-    int max_envs = num_agents;
-
+    int max_envs = use_all_maps ? num_maps : num_agents;
+    int map_idx = 0;
     int maps_checked = 0;
-    PyObject *agent_offsets = PyList_New(max_envs + 1);
-    PyObject *map_ids = PyList_New(max_envs);
+    PyObject* agent_offsets = PyList_New(max_envs+1);
+    PyObject* map_ids = PyList_New(max_envs);
 
-    // Getting env count
-    while (total_agent_count < num_agents && env_count < max_envs) {
-        char map_file[512];
-
-        // Always sample randomly with replacement
-        int map_id = rand() % num_maps;
-
-        // printf("Sampling map_id: %d\n", map_id);
-
-        Drive *env = calloc(1, sizeof(Drive));
+    
+    // getting env count
+    while (use_all_maps ? map_idx < max_envs : total_agent_count < num_agents && env_count < max_envs) {
+        char map_file[1024];
+        int map_id = use_all_maps ? map_idx++ : rand() % num_maps;
+        Drive* env = calloc(1, sizeof(Drive));
+        snprintf(map_file, sizeof(map_file), "%s/%s/map_%06d.bin", data_root, split, map_id);
         env->init_mode = init_mode;
         env->control_mode = control_mode;
         env->init_steps = init_steps;
         env->goal_behavior = goal_behavior;
         env->goal_target_distance = goal_target_distance;
-        env->max_controlled_agents = max_controlled_agents;
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
+        //snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
         env->entities = load_map_binary(map_file, env);
-        // Count the number of controllable agents in map
         set_active_agents(env);
 
         // Skip map if it doesn't contain any controllable agents
         if (env->active_agent_count == 0) {
-            maps_checked++;
+            if (!use_all_maps) {
+                maps_checked++;
 
-            // Safeguard: if we've checked all available maps and found no active agents, raise an error
-            if (maps_checked >= num_maps) {
-                for (int j = 0; j < env->num_entities; j++) {
-                    free_entity(&env->entities[j]);
+                // Safeguard: if we've checked all available maps and found no active agents, raise an error
+                if (maps_checked >= num_maps) {
+                    for (int j = 0; j < env->num_entities; j++) {
+                        free_entity(&env->entities[j]);
+                    }
+                    free(env->entities);
+                    free(env->active_agent_indices);
+                    free(env->static_agent_indices);
+                    free(env->expert_static_agent_indices);
+                    free(env);
+                    Py_DECREF(agent_offsets);
+                    Py_DECREF(map_ids);
+                    char error_msg[256];
+                    sprintf(error_msg, "No controllable agents found in any of the %d available maps", num_maps);
+                    PyErr_SetString(PyExc_ValueError, error_msg);
+                    return NULL;
                 }
-                free(env->entities);
-                free(env->active_agent_indices);
-                free(env->static_agent_indices);
-                free(env->expert_static_agent_indices);
-                free(env->tracks_to_predict_indices);
-                free(env);
-                Py_DECREF(agent_offsets);
-                Py_DECREF(map_ids);
-                char error_msg[256];
-                sprintf(error_msg, "No controllable agents found in any of the %d available maps", num_maps);
-                PyErr_SetString(PyExc_ValueError, error_msg);
-                return NULL;
             }
 
             for (int j = 0; j < env->num_entities; j++) {
@@ -141,7 +176,6 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
             free(env->active_agent_indices);
             free(env->static_agent_indices);
             free(env->expert_static_agent_indices);
-            free(env->tracks_to_predict_indices);
             free(env);
             continue;
         }
@@ -160,19 +194,17 @@ static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
         free(env->entities);
         free(env->active_agent_indices);
         free(env->static_agent_indices);
-        free(env->tracks_to_predict_indices);
         free(env->expert_static_agent_indices);
         free(env);
     }
-
-    if (total_agent_count >= num_agents) {
+    // printf("Generated %d environments to cover %d agents (requested %d agents)\n", env_count, total_agent_count,
+    // num_agents);
+    if (!use_all_maps && total_agent_count >= num_agents) {
         total_agent_count = num_agents;
     }
-
     PyObject *final_total_agent_count = PyLong_FromLong(total_agent_count);
     PyList_SetItem(agent_offsets, env_count, final_total_agent_count);
     PyObject *final_env_count = PyLong_FromLong(env_count);
-
     // resize lists
     PyObject *resized_agent_offsets = PyList_GetSlice(agent_offsets, 0, env_count + 1);
     PyObject *resized_map_ids = PyList_GetSlice(map_ids, 0, env_count);
@@ -197,39 +229,6 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
         PyErr_SetString(PyExc_ValueError, "episode_length must be > 0 (set in INI or kwargs)");
         return -1;
     }
-
-// Allow all settings to be overridden via kwargs (ini provides defaults)
-#define OVERRIDE_INT(field)                                                                                            \
-    if (kwargs && PyDict_GetItemString(kwargs, #field)) {                                                              \
-        conf.field = (int)unpack(kwargs, #field);                                                                      \
-    }
-#define OVERRIDE_FLOAT(field)                                                                                          \
-    if (kwargs && PyDict_GetItemString(kwargs, #field)) {                                                              \
-        conf.field = (float)unpack(kwargs, #field);                                                                    \
-    }
-
-    OVERRIDE_INT(render_mode);
-    OVERRIDE_INT(action_type);
-    OVERRIDE_INT(dynamics_model);
-    OVERRIDE_FLOAT(reward_vehicle_collision);
-    OVERRIDE_FLOAT(reward_offroad_collision);
-    OVERRIDE_FLOAT(reward_goal);
-    OVERRIDE_FLOAT(reward_goal_post_respawn);
-    OVERRIDE_INT(collision_behavior);
-    OVERRIDE_INT(offroad_behavior);
-    OVERRIDE_FLOAT(dt);
-    OVERRIDE_INT(termination_mode);
-    OVERRIDE_INT(init_mode);
-    OVERRIDE_INT(control_mode);
-    OVERRIDE_INT(goal_behavior);
-    OVERRIDE_FLOAT(goal_target_distance);
-    OVERRIDE_FLOAT(goal_radius);
-    OVERRIDE_FLOAT(goal_speed);
-    OVERRIDE_INT(max_controlled_agents);
-
-#undef OVERRIDE_INT
-#undef OVERRIDE_FLOAT
-
     env->action_type = conf.action_type;
     env->dynamics_model = conf.dynamics_model;
     env->reward_vehicle_collision = conf.reward_vehicle_collision;
@@ -248,19 +247,79 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_target_distance = (float)unpack(kwargs, "goal_target_distance");
     env->goal_radius = (float)unpack(kwargs, "goal_radius");
     env->goal_speed = (float)unpack(kwargs, "goal_speed");
-    env->render_mode = (int)unpack(kwargs, "render_mode");
-    char *map_dir = unpack_str(kwargs, "map_dir");
+    //char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
+    char* split = unpack_str(kwargs, "split");
+    char* data_root = unpack_str(kwargs, "data_root");
+
+
     int init_steps = unpack(kwargs, "init_steps");
-    char map_file[512];
-    snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
+    char map_file[1024];
+    // snprintf(map_file, sizeof(map_file), "resources/drive/binaries/map_%03d.bin", map_id);
+    snprintf(map_file, sizeof(map_file), "%s/%s/map_%06d.bin", data_root, split, map_id);
     env->num_agents = max_agents;
     env->map_name = strdup(map_file);
     env->init_steps = init_steps;
     env->timestep = init_steps;
     init(env);
     return 0;
+}
+
+static PyObject* vec_set_goals(PyObject* self, PyObject* args, PyObject* kwargs) {
+    if (PyTuple_Size(args) != 1) {
+        PyErr_SetString(PyExc_TypeError, "vec_set_goals requires 1 positional argument (vec_handle)");
+        return NULL;
+    }
+    VecEnv* vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+
+    PyObject* goal_changes = PyDict_GetItemString(kwargs, "goal_changes");
+    if (!goal_changes || !PyDict_Check(goal_changes)) {
+        PyErr_SetString(PyExc_TypeError, "goal_changes must be a dict {entity_idx: (goal_x, goal_y)}");
+        return NULL;
+    }
+
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(goal_changes, &pos, &key, &value)) {
+        if (!PyLong_Check(key)) {
+            PyErr_SetString(PyExc_TypeError, "goal_changes keys must be integers");
+            return NULL;
+        }
+        int entity_idx = (int)PyLong_AsLong(key);
+
+        if (!PySequence_Check(value) || PySequence_Size(value) < 2) {
+            PyErr_SetString(PyExc_TypeError, "goal_changes values must be [goal_x, goal_y]");
+            return NULL;
+        }
+        PyObject* gx_obj = PySequence_GetItem(value, 0);
+        PyObject* gy_obj = PySequence_GetItem(value, 1);
+        float goal_x = (float)PyFloat_AsDouble(gx_obj);
+        float goal_y = (float)PyFloat_AsDouble(gy_obj);
+        Py_DECREF(gx_obj);
+        Py_DECREF(gy_obj);
+        if (PyErr_Occurred()) return NULL;
+
+        for (int i = 0; i < vec->num_envs; i++) {
+            Drive* env = (Drive*)vec->envs[i];
+            if (!env) continue;
+            // entity_idx may be an active-agent slot (< active_agent_count)
+            // or a direct entity index (>= active_agent_count).
+            // Try active-agent slot first; fall back to direct entity index.
+            int real_idx = entity_idx;
+            if (entity_idx >= 0 && entity_idx < env->active_agent_count) {
+                real_idx = env->active_agent_indices[entity_idx];
+            }
+            if (real_idx >= 0 && real_idx < env->num_entities) {
+                env->entities[real_idx].goal_position_x = goal_x - env->world_mean_x;
+                env->entities[real_idx].goal_position_y = goal_y - env->world_mean_y;
+                env->entities[real_idx].init_goal_x = env->entities[real_idx].goal_position_x;
+                env->entities[real_idx].init_goal_y = env->entities[real_idx].goal_position_y;
+            }
+        }
+    }
+    Py_RETURN_NONE;
 }
 
 static int my_log(PyObject *dict, Log *log) {
@@ -273,8 +332,6 @@ static int my_log(PyObject *dict, Log *log) {
     assign_to_dict(dict, "dnf_rate", log->dnf_rate);
     assign_to_dict(dict, "completion_rate", log->completion_rate);
     assign_to_dict(dict, "lane_alignment_rate", log->lane_alignment_rate);
-    assign_to_dict(dict, "perc_controlled", log->perc_controlled);
-    assign_to_dict(dict, "perc_other", log->perc_other);
     assign_to_dict(dict, "offroad_per_agent", log->offroad_per_agent);
     assign_to_dict(dict, "collisions_per_agent", log->collisions_per_agent);
     assign_to_dict(dict, "goals_sampled_this_episode", log->goals_sampled_this_episode);

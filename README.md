@@ -1,7 +1,5 @@
 # PufferDrive
 
-[![Unit Tests](https://github.com/Emerge-Lab/PufferDrive/actions/workflows/utest.yml/badge.svg)](https://github.com/Emerge-Lab/PufferDrive/actions/workflows/utest.yml)
-
 <img align="left" style="width:260px" src="https://github.com/Emerge-Lab/PufferDrive/blob/main/pufferlib/resources/drive/pufferdrive_20fps_long.gif" width="288px">
 
 **PufferDrive is a fast and friendly driving simulator to train and test RL-based models.**
@@ -76,6 +74,10 @@ puffer train puffer_drive
 To train with PufferDrive, you need to convert JSON files to map binaries. Run the following command with the path to your data folder:
 
 ```bash
+
+export DRIVE_BINARIES_DATA_ROOT=your/path/to/binaries
+export DRIVE_DATA_ROOT=your/path/to/jsons
+
 python pufferlib/ocean/drive/drive.py
 ```
 
@@ -156,6 +158,37 @@ The `-s` flag sets up a virtual screen at 1280x720 resolution with 24-bit color 
 </details>
 
 
+## Interactive demo
+
+<details>
+<summary>Browser-based scenario viewer and editor</summary>
+
+`demo/` contains a browser-based demo built with [Reflex](https://reflex.dev). It loads a map
+binary, rolls out a trained policy, and lets you edit the scene — move agents, retarget goals,
+add or remove vehicles, draw expert trajectories — then re-simulate and scrub through the
+result. A second "ghost" environment can run a different policy on the same scene for
+side-by-side comparison, and any edited scene can be saved to JSON and reloaded later.
+
+Quick start, from an activated virtual environment with the package installed:
+
+```bash
+pip install -r demo/requirements.txt
+export DRIVE_BINARIES_DATA_ROOT=/path/to/your/binaries
+cd demo && ./run.sh
+```
+
+Then open http://localhost:3000. `run.sh` builds the C extension, links in
+`pufferlib/resources`, and launches the app.
+
+Which maps and policies the demo offers is set by a profile ini in `demo/config/`
+(see `demo/config/example.ini`).
+
+See [demo/README.md](demo/README.md) for the full setup, the environment variables
+(`DRIVE_BINARIES_DATA_ROOT`, `DRIVE_CONFIG_DIR`, `DRIVE_SCENARIOS_DIR`, `HOST_IP`), the
+profile format, remote access over an SSH tunnel, and troubleshooting.
+
+</details>
+
 ## Benchmarks
 
 ### Distributional realism
@@ -209,7 +242,7 @@ To edit the browser demo, follow these steps:
 If you use PufferDrive in your research, please cite:
 ```bibtex
 @software{pufferdrive2025github,
-  author = {Daphne Cornelisse* and Spencer Cheng* and Pragnay Mandavilli and Julian Hunt and Kevin Joseph and Waël Doulazmi and Valentin Charraut and Aditya Gupta and Joseph Suarez and Eugene Vinitsky},
+  author = {Daphne Cornelisse* and Spencer Cheng* and Pragnay Mandavilli and Julian Hunt and Kevin Joseph and Waël Doulazmi and Aditya Gupta and Eugene Vinitsky},
   title = {{PufferDrive}: A Fast and Friendly Driving Simulator for Training and Evaluating {RL} Agents},
   url = {https://github.com/Emerge-Lab/PufferDrive},
   version = {2.0.0},

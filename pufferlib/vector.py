@@ -1,3 +1,11 @@
+# Copyright (c) 2026 Robert Bosch GmbH
+# SPDX-License-Identifier: AGPL-3.0
+
+# This source code is derived from PufferDrive V2.0
+# (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+# Copyright (c) PufferDrive authors, licensed under the MIT license,
+# cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 # TODO: Check actions passed to envs are right shape? On first call at least
 
 
@@ -303,6 +311,7 @@ class Multiprocessing:
         self.envs_per_worker = envs_per_worker
         self.workers_per_batch = batch_size // envs_per_worker
         self.num_workers = num_workers
+        self.num_timed_out = 0
 
         # I really didn't want to need a driver process... with mp.shared_memory
         # we can fetch this data from the worker processes and ever perform
@@ -328,6 +337,7 @@ class Multiprocessing:
 
         atn_ctype = np.ctypeslib.as_ctypes_type(atn_dtype)
 
+        self.agents_per_worker = agents_per_worker # needed to get worker_number from agent_ids
         self.single_observation_space = driver_env.single_observation_space
         self.single_action_space = driver_env.single_action_space
         self.action_space = pufferlib.spaces.joint_space(self.single_action_space, self.agents_per_batch)
@@ -413,7 +423,7 @@ class Multiprocessing:
             if self.sync_traj:
                 worker = self.waiting_workers[0]
                 sem = self.buf["semaphores"][worker]
-                if sem >= MAIN:
+                if sem >= MAIN: # worker goes from waiting to ready, if it is not set to STEP anymore
                     self.waiting_workers.pop(0)
                     self.ready_workers.append(worker)
             else:
@@ -537,6 +547,45 @@ class Multiprocessing:
         self.driver_env.close()
         for p in self.processes:
             p.terminate()
+
+    def enable_recv(self):
+        self.flag = RECV    
+
+    def enable_send(self):
+        self.flag = SEND
+
+    # def sync_get_observations(self, agent_ids, timeout=2.0):
+    #     """
+    #     Synchronizes specific workers and returns their current observations.
+    #     Ensures that any pending INFO messages are received to prevent Pipe deadlocks.
+    #     """
+    #     agent_id_start = agent_ids.start
+    #     agent_id_stop = agent_ids.stop
+    #     first_worker = agent_id_start // self.agents_per_worker
+    #     last_worker = (agent_id_stop - 1) // self.agents_per_worker
+    #     worker_indices = np.arange(first_worker, last_worker + 1)
+    #     start_time = time.time()
+    #     while not np.all(self.buf["semaphores"][worker_indices] >= MAIN):
+    #         # 1. Wait until the worker has finished its STEP or RESET
+    #         # In PufferLib, MAIN (or values > MAIN like INFO) indicates worker is idle
+    #         if time.time() - start_time > timeout:
+    #             self.num_timed_out += 1
+    #             print(f"Worker {worker_indices} timed out during bootstrap peek but already for {self.num_timed_out} times!!")
+    #             size = self.agents_per_worker * self.workers_per_batch
+    #             return np.full(self.obs_batch_shape, -1000, dtype=np.float32), np.full(size, -1000, dtype=np.float32), np.full(size, -1, dtype=np.float32), np.full(size, -1, dtype=np.float32), np.full(size, False, dtype=bool), np.full(size, -1, dtype=np.float32) # invalid observations, rewards, terminals, agents, masks, truncations
+    #         time.sleep(0.001) # Small sleep to save CPU cycles
+    #         # would be interesting to see, how often this timeout happens in practice
+        
+    #     # 3. Now it is safe to read the shared memory buffer for these workers
+    #     # These observations are the s_{t+1} relative to the last action sent.
+    #     worker_slice = slice(worker_indices.min(), worker_indices.max() + 1)
+    #     obs = self.buf["observations"][worker_slice].reshape(self.obs_batch_shape)
+    #     r = self.buf["rewards"][worker_slice].ravel()
+    #     terminals = self.buf["terminals"][worker_slice].ravel()
+    #     masks = self.buf["masks"][worker_slice].ravel()
+    #     truncations = self.buf["truncations"][worker_slice].ravel()
+    #     agent_ids = self.agent_ids[worker_slice].ravel()
+    #     return obs, r, terminals, agent_ids, masks, truncations
 
 
 class Ray:

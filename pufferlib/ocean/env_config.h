@@ -1,3 +1,11 @@
+// Copyright (c) 2026 Robert Bosch GmbH
+// SPDX-License-Identifier: AGPL-3.0
+
+// This source code is derived from PufferDrive V2.0
+// (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+// Copyright (c) PufferDrive authors, licensed under the MIT license,
+// cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 #ifndef ENV_CONFIG_H
 #define ENV_CONFIG_H
 
@@ -8,7 +16,6 @@
 
 // Config struct for parsing INI files - contains all environment configuration
 typedef struct {
-    int render_mode;
     int action_type;
     int dynamics_model;
     float reward_vehicle_collision;
@@ -29,8 +36,8 @@ typedef struct {
     int init_steps;
     int init_mode;
     int control_mode;
-    int max_controlled_agents;
-    char map_dir[256];
+    //char map_dir[256];
+    char split[256];
 } env_init_config;
 
 // INI file parser handler - parses all environment configuration from drive.ini
@@ -89,39 +96,28 @@ static int handler(void *config, const char *section, const char *name, const ch
     } else if (MATCH("env", "init_steps")) {
         env_config->init_steps = atoi(value);
     } else if (MATCH("env", "init_mode")) {
-        if (strcmp(value, "\"create_all_valid\"") == 0 || strcmp(value, "create_all_valid") == 0) {
-            env_config->init_mode = 0;
-        } else if (strcmp(value, "\"create_only_controlled\"") == 0 || strcmp(value, "create_only_controlled") == 0) {
-            env_config->init_mode = 1;
-        } else {
-            printf("Warning: Unknown init_mode value '%s', defaulting to CREATE_ALL_VALID\n", value);
-            env_config->init_mode = 0; // Default to CREATE_ALL_VALID
-        }
+        env_config->init_mode = atoi(value);
     } else if (MATCH("env", "control_mode")) {
-        if (strcmp(value, "\"control_vehicles\"") == 0 || strcmp(value, "control_vehicles") == 0) {
-            env_config->control_mode = 0;
-        } else if (strcmp(value, "\"control_agents\"") == 0 || strcmp(value, "control_agents") == 0) {
-            env_config->control_mode = 1;
-        } else if (strcmp(value, "\"control_wosac\"") == 0 || strcmp(value, "control_wosac") == 0) {
-            env_config->control_mode = 2;
-        } else if (strcmp(value, "\"control_sdc_only\"") == 0 || strcmp(value, "control_sdc_only") == 0) {
-            env_config->control_mode = 3;
-        } else if (strcmp(value, "\"control_mixed_play\"") == 0 || strcmp(value, "control_mixed_play") == 0) {
-            env_config->control_mode = 4;
-        } else {
-            printf("Warning: Unknown control_mode value '%s', defaulting to CONTROL_VEHICLES\n", value);
-            env_config->control_mode = 0; // Default to CONTROL_VEHICLES
+        env_config->control_mode = atoi(value);
+    } else if (MATCH("env", "split")) {
+        if (sscanf(value, "\"%255[^\"]\"", env_config->split) != 1) {
+            strncpy(env_config->split, value, sizeof(env_config->split) - 1);
+            env_config->split[sizeof(env_config->split) - 1] = '\0';
         }
-    } else if (MATCH("env", "map_dir")) {
-        if (sscanf(value, "\"%255[^\"]\"", env_config->map_dir) != 1) {
-            strncpy(env_config->map_dir, value, sizeof(env_config->map_dir) - 1);
-            env_config->map_dir[sizeof(env_config->map_dir) - 1] = '\0';
-        }
-        // printf("Parsed map_dir: '%s'\n", env_config->map_dir);
-    } else if (MATCH("env", "max_controlled_agents")) {
-        env_config->max_controlled_agents = atoi(value);
+        //printf("Parsed map_dir: '%s'\n", env_config->map_dir);
+
+
+    // } else if (MATCH("env", "map_dir")) {
+    //     if (sscanf(value, "\"%255[^\"]\"", env_config->map_dir) != 1) {
+    //         strncpy(env_config->map_dir, value, sizeof(env_config->map_dir) - 1);
+    //         env_config->map_dir[sizeof(env_config->map_dir) - 1] = '\0';
+    //     }
+    //     //printf("Parsed map_dir: '%s'\n", env_config->map_dir);
+
+    
     } else {
-        return 0; // Unknown section/name, indicate failure to handle
+
+    return 0;  // Unknown section/name, indicate failure to handle
     }
 
 #undef MATCH

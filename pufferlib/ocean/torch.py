@@ -22,7 +22,9 @@ class Drive(nn.Module):
         self.max_road_objects = env.max_road_objects
         self.road_features = env.road_features
         self.road_features_after_onehot = env.road_features + 6  # 6 is the number of one-hot encoded categories
-        self.ego_dim = env.ego_features
+
+        # Determine ego dimension from environment's dynamics model
+        self.ego_dim = 10 if env.dynamics_model == "jerk" else 7
 
         self.ego_encoder = nn.Sequential(
             pufferlib.pytorch.layer_init(nn.Linear(self.ego_dim, input_size)),
@@ -66,11 +68,6 @@ class Drive(nn.Module):
 
     def forward_train(self, x, state=None):
         return self.forward(x, state)
-
-    def forward_eval(self, observations, state=None):
-        hidden = self.encode_observations(observations, state=state)
-        logits, values = self.decode_actions(hidden)
-        return logits, values
 
     def encode_observations(self, observations, state=None):
         ego_dim = self.ego_dim

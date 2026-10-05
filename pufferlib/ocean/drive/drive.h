@@ -1,5 +1,11 @@
-#include <signal.h>
-#include <sys/types.h>
+// Copyright (c) 2026 Robert Bosch GmbH
+// SPDX-License-Identifier: AGPL-3.0
+
+// This source code is derived from PufferDrive V2.0
+// (https://github.com/Emerge-Lab/PufferDrive, version 1d864db)
+// Copyright (c) PufferDrive authors, licensed under the MIT license,
+// cf. 3rd-party-licenses.txt file in the root directory of this source tree.
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -13,21 +19,6 @@
 #include "rlgl.h"
 #include <time.h>
 #include "error.h"
-
-// Render modes
-#define RENDER_WINDOW 0
-#define RENDER_HEADLESS 1
-
-// View modes
-#define VIEW_MODE_SIM_STATE 0
-#define VIEW_MODE_BEV_AGENT_OBS 1
-#define VIEW_MODE_AGENT_PERSP 2
-
-// Order of entities in rendering (lower is rendered first)
-#define Z_ROAD_SURFACE 0.0f
-#define Z_ROAD_MARKINGS 0.05f // Lane lines, road lines, traces
-#define Z_AGENT_DETAILS 0.4f  // Arrow, goal markers, obs overlays
-#define Z_AGENTS 0.6f         // Vehicles, cyclists, pedestrians
 
 // Entity Types
 #define NONE 0
@@ -56,7 +47,6 @@
 #define CONTROL_AGENTS 1
 #define CONTROL_WOSAC 2
 #define CONTROL_SDC_ONLY 3
-#define CONTROL_MIXED_PLAY 4
 
 // Minimum distance to goal position
 #define MIN_DISTANCE_TO_GOAL 2.0f
@@ -95,13 +85,18 @@
 #define STOP_AGENT 1
 #define REMOVE_AGENT 2
 
+// Extra vehicle slots reserved for user injections (dynamic + static combined)
+#define N_INJECTION_RESERVE 20
+#define PARKED_X -90000.0f
+#define PARKED_Y -90000.0f
+
 #define ROAD_FEATURES 7
 #define ROAD_FEATURES_ONEHOT 13
 #define PARTNER_FEATURES 7
 
 // Ego features depend on dynamics model
-#define EGO_FEATURES_CLASSIC 8
-#define EGO_FEATURES_JERK 11
+#define EGO_FEATURES_CLASSIC 7
+#define EGO_FEATURES_JERK 10
 
 // Observation normalization constants
 #define MAX_SPEED 100.0f
@@ -122,6 +117,7 @@
 #define GOAL_RESPAWN 0
 #define GOAL_GENERATE_NEW 1
 #define GOAL_STOP 2
+#define GOAL_REMOVE 3
 
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
@@ -156,13 +152,6 @@ const Color PUFF_BACKGROUND2 = (Color){18, 72, 72, 255};
 const Color LIGHTGREEN = (Color){152, 255, 152, 255};
 const Color LIGHTYELLOW = (Color){255, 255, 152, 255};
 const Color SOFT_YELLOW = (Color){245, 245, 220, 255};
-const Color ROAD_COLOR = (Color){35, 35, 37, 255};
-const Color LIGHTBLUE = (Color){167, 204, 255, 255};
-const Color DEEPBLUE = (Color){45, 112, 226, 255};
-const Color EXPERT_REPLAY = (Color){162, 220, 183, 255};
-const Color EXPERT_REPLAY_SMALL = (Color){95, 112, 93, 255};
-const Color LIGHT_ORANGE = (Color){255, 160, 80, 255};
-const Color LIGHT_PURPLE = (Color){204, 204, 255, 255};
 
 struct timespec ts;
 
@@ -188,8 +177,6 @@ struct Log {
     float active_agent_count;
     float expert_static_agent_count;
     float static_agent_count;
-    float perc_controlled;
-    float perc_other;
 };
 
 typedef struct Entity Entity;
@@ -327,6 +314,20 @@ struct Drive {
     int *static_agent_indices;
     int expert_static_agent_count;
     int *expert_static_agent_indices;
+    // Saved after init() so resimulation can restore the pre-injection state
+    int orig_active_agent_count;
+    int orig_static_agent_count;
+    int orig_expert_static_agent_count;
+    int orig_num_actors;
+    // Pre-reserved active slots: always in active_agent_indices, parked at PARKED_X/Y
+    int n_reserved_slots;
+    int *reserved_slot_entities;
+    // Demo shared slot pool: free entities live in demo_free_entity_indices (a stack).
+    // When injecting, pop from the stack; when resetting, rebuild the stack.
+    int demo_slot_base;            // entity index of the first demo entity
+    int demo_n_total_slots;        // total demo entities allocated so far
+    int demo_n_free_slots;         // how many are currently uninjected (== MAX_AGENTS - num_actors)
+    int *demo_free_entity_indices; // stack of entity indices that are free
     int timestep;
     int init_steps;
     int dynamics_model;
@@ -344,11 +345,12 @@ struct Drive {
     float reward_goal_post_respawn;
     float goal_radius;
     float goal_speed;
+    int max_controlled_agents;
     int logs_capacity;
     int goal_behavior;
     float goal_target_distance;
     char *ini_file;
-    char scenario_id[16];
+    char *scenario_id;
     int collision_behavior;
     int offroad_behavior;
     int sdc_track_index;
@@ -356,8 +358,6 @@ struct Drive {
     int *tracks_to_predict_indices;
     int init_mode;
     int control_mode;
-    int max_controlled_agents;
-    int render_mode;
 };
 
 void add_log(Drive *env) {
@@ -379,15 +379,19 @@ void add_log(Drive *env) {
         float frac_goal_reached = e->goals_reached_this_episode / e->goals_sampled_this_episode;
 
         // Update score, which is an aggregate measure whether the agent fully solved its task
-        float threshold = 1.0f; // Default threshold for 1 goal (must complete it)
-        if (e->goals_sampled_this_episode > 1) {
-            // For multiple goals, require n-1 goals to be reached
-            threshold = (e->goals_sampled_this_episode - 1.0f) / e->goals_sampled_this_episode;
+        // Note: When resampling goals, performance is relative to the number of goals sampled
+        float threshold = 0.99f; // Default threshold for 1 goal
+        if (e->goals_sampled_this_episode == 2.0f) {
+            threshold = 0.5f; // Require ≥50% completion for 2 goals
+        } else if (e->goals_sampled_this_episode < 5.0f) {
+            threshold = 0.8f; // Require ≥80% completion for 3-4 goals
+        } else {
+            threshold = 0.9f; // Require ≥90% completion for 5+ goals
         }
 
         int collision_occurred =
             (env->goal_behavior == GOAL_RESPAWN) ? e->collided_before_goal : env->logs[i].collision_rate;
-        if (frac_goal_reached >= threshold && !collision_occurred) {
+        if (frac_goal_reached > threshold && !collision_occurred) {
             env->log.score += 1.0f;
         }
         if (!offroad && !collided && frac_goal_reached < 1.0f) {
@@ -402,9 +406,6 @@ void add_log(Drive *env) {
         env->log.active_agent_count += env->active_agent_count;
         env->log.expert_static_agent_count += env->expert_static_agent_count;
         env->log.static_agent_count += env->static_agent_count;
-        int total = env->active_agent_count + env->static_agent_count;
-        env->log.perc_controlled += (float)env->active_agent_count / (float)total;
-        env->log.perc_other += (float)env->static_agent_count / (float)total;
         env->log.n += 1;
     }
 }
@@ -413,9 +414,6 @@ Entity *load_map_binary(const char *filename, Drive *env) {
     FILE *file = fopen(filename, "rb");
     if (!file)
         return NULL;
-
-    // Read scenario_id
-    fread(env->scenario_id, sizeof(char), 16, file);
 
     // Read sdc_track_index
     fread(&env->sdc_track_index, sizeof(int), 1, file);
@@ -519,14 +517,14 @@ void set_start_position(Drive *env) {
             e->vz = 0;
             e->collided_before_goal = 0;
         } else {
-            e->vx = e->traj_vx[env->init_steps];
-            e->vy = e->traj_vy[env->init_steps];
-            e->vz = e->traj_vz[env->init_steps];
+            e->vx = e->traj_vx[step];
+            e->vy = e->traj_vy[step];
+            e->vz = e->traj_vz[step];
         }
-        e->heading = e->traj_heading[env->init_steps];
+        e->heading = e->traj_heading[step];
         e->heading_x = cosf(e->heading);
         e->heading_y = sinf(e->heading);
-        e->valid = e->traj_valid[env->init_steps];
+        e->valid = e->traj_valid[step];
         e->collision_state = 0;
         e->metrics_array[COLLISION_IDX] = 0.0f;    // vehicle collision
         e->metrics_array[OFFROAD_IDX] = 0.0f;      // offroad
@@ -993,25 +991,18 @@ int collision_check(Drive *env, int agent_idx) {
     if (agent->x == INVALID_POSITION)
         return -1;
 
-    // Skip collision checking for pedestrians because they are often too
-    // close to other entities at initialization.
-    if (agent->type == PEDESTRIAN)
-        return -1;
-
     int car_collided_with_index = -1;
 
     if (agent->respawn_timestep != -1)
         return car_collided_with_index; // Skip respawning entities
 
-    for (int i = 0; i < MAX_AGENTS; i++) {
+    for (int i = 0; i < env->num_actors; i++) {
         int index = -1;
         if (i < env->active_agent_count) {
             index = env->active_agent_indices[i];
-        } else if (i < env->num_actors && env->static_agent_count > 0) {
+        } else {
             index = env->static_agent_indices[i - env->active_agent_count];
         }
-        if (index == -1)
-            continue;
         if (index == agent_idx)
             continue;
         Entity *entity = &env->entities[index];
@@ -1111,13 +1102,13 @@ float point_to_segment_distance_2d(float px, float py, float x1, float y1, float
     return sqrtf((px - closestX) * (px - closestX) + (py - closestY) * (py - closestY));
 }
 
-void compute_agent_metrics(Drive *env, int agent_idx) {
+void compute_agent_metrics(Drive *env, int agent_idx, int env_idx) {
     Entity *agent = &env->entities[agent_idx];
 
     reset_agent_metrics(env, agent_idx);
 
     if (agent->x == INVALID_POSITION)
-        return; // invalid agent position
+        return; // invalid agent position (e.g. if removed before.)
 
     int collided = 0;
     float half_length = agent->length / 2.0f;
@@ -1148,8 +1139,8 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         Entity *entity;
         entity = &env->entities[entity_list[i].entity_idx];
 
-        // Check for offroad collision with road edges (only for vehicles and cyclists)
-        if (entity->type == ROAD_EDGE && agent->type != PEDESTRIAN) {
+        // Check for offroad collision with road edges
+        if (entity->type == ROAD_EDGE) {
             int geometry_idx = entity_list[i].geometry_idx;
             float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
@@ -1204,49 +1195,48 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
     }
 
-    // Check for vehicle collisions (skip for pedestrians)
-    int car_collided_with_index = -1;
-    if (agent->type != PEDESTRIAN) {
-        car_collided_with_index = collision_check(env, agent_idx);
-        if (car_collided_with_index != -1)
-            collided = VEHICLE_COLLISION;
-    }
+    // Check for vehicle collisions
+    int car_collided_with_index = collision_check(env, agent_idx);
+    if (car_collided_with_index != -1)
+        collided = VEHICLE_COLLISION;
 
     agent->collision_state = collided;
 
     if (collided == VEHICLE_COLLISION) {
         if (env->collision_behavior == STOP_AGENT && !agent->stopped) {
             agent->stopped = 1;
-            agent->vx = agent->vy = 0.0f;
         } else if (env->collision_behavior == REMOVE_AGENT && !agent->removed) {
-            Entity *agent_collided = &env->entities[car_collided_with_index];
             agent->removed = 1;
-            agent_collided->removed = 1;
-            agent->x = agent->y = -10000.0f;
-            agent_collided->x = agent_collided->y = -10000.0f;
+        } else if (env->collision_behavior > REMOVE_AGENT) {
+            printf("Unknown setting for collision_behavior!");
         }
     }
     if (collided == OFFROAD) {
         agent->metrics_array[OFFROAD_IDX] = 1.0f;
         if (env->offroad_behavior == STOP_AGENT && !agent->stopped) {
             agent->stopped = 1;
-            agent->vx = agent->vy = 0.0f;
         } else if (env->offroad_behavior == REMOVE_AGENT && !agent->removed) {
             agent->removed = 1;
-            agent->x = agent->y = -10000.0f;
+        } else if (env->offroad_behavior > REMOVE_AGENT) {
+            printf("Unknown setting for offroad_behavior!");
         }
     }
 
     return;
 }
 
-bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
+bool should_control_agent(Drive *env, int agent_idx) {
+
     // Check if we have room for more agents or are already at capacity
-    if (env->active_agent_count >= control_limit) {
+    if (env->active_agent_count >= env->num_agents) {
         return false;
     }
 
     Entity *entity = &env->entities[agent_idx];
+
+    // TODO: Move this elsewhere or remove
+    // entity->width *= 0.7f;
+    // entity->length *= 0.7f;
 
     if (env->control_mode == CONTROL_SDC_ONLY) {
         return agent_idx == env->sdc_track_index;
@@ -1295,7 +1285,7 @@ void set_active_agents(Drive *env) {
     env->active_agent_count = 0;        // Policy-controlled agents
     env->static_agent_count = 0;        // Non-moving background agents
     env->expert_static_agent_count = 0; // Expert replay agents (non-controlled)
-    env->num_actors = 0;                // Total agents created (there is always the SDC)
+    env->num_actors = 0;                // Total agents created
 
     int active_agent_indices[MAX_AGENTS];
     int static_agent_indices[MAX_AGENTS];
@@ -1305,30 +1295,8 @@ void set_active_agents(Drive *env) {
         env->num_agents = MAX_AGENTS;
     }
 
-    int control_limit;
-    if (env->control_mode == CONTROL_MIXED_PLAY) {
-        control_limit = (env->max_controlled_agents < env->num_agents) ? env->max_controlled_agents : env->num_agents;
-    } else {
-        control_limit = env->num_agents;
-    }
-
-    // If we have a SDC index (WOMD), initialize it first:
-    int sdc_index = env->sdc_track_index;
-
-    if (sdc_index >= 0) {
-        active_agent_indices[0] = sdc_index;
-        env->num_actors++;
-        env->active_agent_count++;
-        env->entities[sdc_index].active_agent = 1;
-    }
-
     // Iterate through entities to find agents to create and/or control
     for (int i = 0; i < env->num_objects && env->num_actors < MAX_AGENTS; i++) {
-
-        // Skip if its the SDC
-        if (i == sdc_index) {
-            continue;
-        }
 
         Entity *entity = &env->entities[i];
 
@@ -1355,7 +1323,7 @@ void set_active_agents(Drive *env) {
         // Determine if this agent should be policy-controlled
         bool is_controlled = false;
 
-        is_controlled = should_control_agent(env, i, control_limit);
+        is_controlled = should_control_agent(env, i);
 
         if (is_controlled) {
             active_agent_indices[env->active_agent_count] = i;
@@ -1363,9 +1331,9 @@ void set_active_agents(Drive *env) {
             env->entities[i].active_agent = 1;
         } else if (env->init_mode != INIT_ONLY_CONTROLLABLE_AGENTS) {
             static_agent_indices[env->static_agent_count] = i;
-            env->static_agent_count++; // Includes expert replay and static agents
+            env->static_agent_count++;
             env->entities[i].active_agent = 0;
-            if (env->entities[i].mark_as_expert == 1 || env->active_agent_count == control_limit) {
+            if (env->entities[i].mark_as_expert == 1 || env->active_agent_count == env->num_agents) {
                 expert_static_agent_indices[env->expert_static_agent_count] = i;
                 env->expert_static_agent_count++;
                 env->entities[i].mark_as_expert = 1;
@@ -1373,10 +1341,10 @@ void set_active_agents(Drive *env) {
         }
     }
 
-    // Set up initial active agents
-    env->active_agent_indices = (int *)malloc(env->active_agent_count * sizeof(int));
-    env->static_agent_indices = (int *)malloc(env->static_agent_count * sizeof(int));
-    env->expert_static_agent_indices = (int *)malloc(env->expert_static_agent_count * sizeof(int));
+    // Pre-allocate with MAX_AGENTS capacity — no realloc ever needed for these arrays.
+    env->active_agent_indices        = (int *)malloc(MAX_AGENTS * sizeof(int));
+    env->static_agent_indices        = (int *)malloc(MAX_AGENTS * sizeof(int));
+    env->expert_static_agent_indices = (int *)malloc(MAX_AGENTS * sizeof(int));
     for (int i = 0; i < env->active_agent_count; i++) {
         env->active_agent_indices[i] = active_agent_indices[i];
     };
@@ -1386,9 +1354,6 @@ void set_active_agents(Drive *env) {
     for (int i = 0; i < env->expert_static_agent_count; i++) {
         env->expert_static_agent_indices[i] = expert_static_agent_indices[i];
     }
-    // printf("Total actors: %d, Active agents: %d, Static agents: %d, Expert static agents: %d\n", env->num_actors,
-    //        env->active_agent_count, env->static_agent_count, env->expert_static_agent_count);
-    // printf("Control mode: %d, max controlled agents: %d\n", env->control_mode, env->max_controlled_agents);
 
     return;
 }
@@ -1469,21 +1434,581 @@ void init(Drive *env) {
     set_start_position(env);
     init_goal_positions(env);
     env->logs = (Log *)calloc(env->active_agent_count, sizeof(Log));
+    // Snapshot counts so resimulation can undo injections cleanly
+    env->orig_active_agent_count       = env->active_agent_count;
+    env->orig_static_agent_count       = env->static_agent_count;
+    env->orig_expert_static_agent_count = env->expert_static_agent_count;
+    env->orig_num_actors               = env->num_actors;
+    env->n_reserved_slots    = 0;
+    env->reserved_slot_entities = NULL;
+    env->demo_slot_base            = 0;
+    env->demo_n_total_slots        = 0;
+    env->demo_n_free_slots         = 0;
+    env->demo_free_entity_indices  = NULL;
 }
 
-void close_client(Client *client);
+void prepare_reserved_slots(Drive *env) {
+    if (env->n_reserved_slots > 0) return;  // already called
+    int found = 0;
+    int reserve[N_INJECTION_RESERVE];
+    for (int i = 0; i < env->num_objects && found < N_INJECTION_RESERVE; i++) {
+        Entity *e = &env->entities[i];
+        if (e->type != VEHICLE) continue;
+        if (e->active_agent == 1) continue;
+        int in_any = 0;
+        for (int j = 0; j < env->expert_static_agent_count && !in_any; j++)
+            if (env->expert_static_agent_indices[j] == i) in_any = 1;
+        for (int j = 0; j < env->static_agent_count && !in_any; j++)
+            if (env->static_agent_indices[j] == i) in_any = 1;
+        if (!in_any) reserve[found++] = i;
+    }
+    if (found == 0) return;
+
+    env->reserved_slot_entities = (int *)malloc(found * sizeof(int));
+    for (int k = 0; k < found; k++) {
+        int idx = reserve[k];
+        Entity *e = &env->entities[idx];
+        e->x = PARKED_X; e->y = PARKED_Y; e->z = 0.0f;
+        e->vx = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+        e->heading = 0.0f; e->heading_x = 1.0f; e->heading_y = 0.0f;
+        // active_agent=1 blocks the spare search without adding to any list yet;
+        // removed=1 keeps the slot available for injection
+        e->valid = 1; e->active_agent = 1; e->removed = 1; e->stopped = 0;
+        e->mark_as_expert = 0; e->collision_state = 0;
+        if (e->length <= 0.0f) e->length = 4.5f;
+        if (e->width  <= 0.0f) e->width  = 2.0f;
+        env->reserved_slot_entities[k] = idx;
+    }
+    // active_agent_count, num_actors, and orig_* are NOT updated here.
+    // Reserved slots are accounted for only when actually injected (treated as spares).
+    env->n_reserved_slots = found;
+}
+
+// ── Demo ghost slots ──────────────────────────────────────────────────────────
+// Called once after init()+reset(). Allocates MAX_AGENTS - num_actors shared demo slots,
+// all pre-parked at INVALID_POSITION in static_agent_indices. Each slot can be dynamically
+// used as active, static, or expert on demand.
+
+// Debug-only consistency check. num_actors must always equal the number of
+// distinct actor entities, which is active_agent_count + static_agent_count
+// (experts are a SUBSET of statics, never counted separately — see
+// set_active_agents and inject_demo_expert_agent). A violation means a detach or
+// inject path desynced the counts and is the precursor to heap corruption.
+static inline void drive_assert_actor_invariant(Drive *env, const char *where) {
+#ifndef NDEBUG
+    if (env->num_actors != env->active_agent_count + env->static_agent_count
+        || env->num_actors < 0 || env->expert_static_agent_count < 0
+        || env->expert_static_agent_count > env->static_agent_count) {
+        fprintf(stderr,
+            "[PufferDrive][INVARIANT] %s: num_actors=%d active=%d static=%d expert=%d\n",
+            where, env->num_actors, env->active_agent_count,
+            env->static_agent_count, env->expert_static_agent_count);
+        fflush(stderr);
+    }
+#else
+    (void)env; (void)where;
+#endif
+}
+
+void prepare_demo_slots(Drive *env) {
+    // Compute how many NEW demo entities to allocate.
+    // demo_n_free_slots are already available; num_actors are in use.
+    // Together they must fill MAX_AGENTS: n_new = (MAX_AGENTS - num_actors) - demo_n_free_slots.
+    int n_new = (MAX_AGENTS - env->num_actors) - env->demo_n_free_slots;
+    if (n_new <= 0) return;
+    // Hard ceiling: the demo free-entity stack (demo_free_entity_indices) is sized
+    // to MAX_AGENTS, so the total number of demo slots must never exceed it. Clamp
+    // defensively in case a count desync ever pushes n_new too high.
+    if (env->demo_n_total_slots + n_new > MAX_AGENTS)
+        n_new = MAX_AGENTS - env->demo_n_total_slots;
+    if (n_new <= 0) return;
+
+    int base = env->num_entities;
+    int first_call = (env->demo_n_total_slots == 0);
+    if (first_call) {
+        env->demo_slot_base           = base;
+        env->demo_free_entity_indices = (int *)malloc(MAX_AGENTS * sizeof(int));
+        // Only resize logs once (first prepare).
+        // observations/actions/rewards/terminals/truncations are owned by Python NumPy — never realloc them.
+        env->logs          = (Log *)realloc(env->logs, MAX_AGENTS * sizeof(Log));
+        env->logs_capacity = MAX_AGENTS;
+    }
+
+    // Allocate n_new synthetic entities with full TRAJECTORY_LENGTH arrays so any slot
+    // can later be promoted to expert without re-allocation.
+    env->entities = (Entity *)realloc(env->entities, (base + n_new) * sizeof(Entity));
+    memset(&env->entities[base], 0, n_new * sizeof(Entity));
+    for (int k = 0; k < n_new; k++) {
+        Entity *e = &env->entities[base + k];
+        e->type       = VEHICLE;
+        e->id         = -(env->demo_n_total_slots + k + 1); // negative → synthetic
+        e->array_size = TRAJECTORY_LENGTH;
+        e->traj_x       = (float *)malloc(TRAJECTORY_LENGTH * sizeof(float));
+        e->traj_y       = (float *)malloc(TRAJECTORY_LENGTH * sizeof(float));
+        e->traj_z       = (float *)calloc(TRAJECTORY_LENGTH, sizeof(float));
+        e->traj_vx      = (float *)calloc(TRAJECTORY_LENGTH, sizeof(float));
+        e->traj_vy      = (float *)calloc(TRAJECTORY_LENGTH, sizeof(float));
+        e->traj_vz      = (float *)calloc(TRAJECTORY_LENGTH, sizeof(float));
+        e->traj_heading = (float *)calloc(TRAJECTORY_LENGTH, sizeof(float));
+        e->traj_valid   = (int   *)calloc(TRAJECTORY_LENGTH, sizeof(int));
+        for (int i = 0; i < TRAJECTORY_LENGTH; i++) {
+            e->traj_x[i]     = INVALID_POSITION;
+            e->traj_y[i]     = INVALID_POSITION;
+            e->traj_valid[i] = 1;   // valid but at INVALID_POSITION → invisible
+        }
+        e->length = 4.5f; e->width = 2.0f; e->height = 1.5f;
+        e->x = INVALID_POSITION; e->y = INVALID_POSITION; e->z = 0.0f;
+        e->vx = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+        e->heading = 0.0f; e->heading_x = 1.0f; e->heading_y = 0.0f;
+        e->valid = 1; e->active_agent = 0; e->removed = 0; e->stopped = 1;
+        e->collision_state = 0; e->mark_as_expert = 0;
+        // memset left respawn_timestep at 0, which collision_check and
+        // compute_observations treat as "respawning" and skip entirely.
+        e->respawn_timestep = -1;
+        // Push onto the free-entity stack (not into static_agent_indices).
+        env->demo_free_entity_indices[env->demo_n_free_slots++] = base + k;
+    }
+    env->num_entities    += n_new;
+    env->demo_n_total_slots += n_new;
+
+    // Snapshot current counts as the post-prepare baseline.
+    // c_reset_injections and reset_demo_slots restore to these values.
+    // Updated on every call so agent-removal + re-prepare shifts the baseline.
+    env->orig_active_agent_count        = env->active_agent_count;
+    env->orig_static_agent_count        = env->static_agent_count;
+    env->orig_expert_static_agent_count = env->expert_static_agent_count;
+    env->orig_num_actors                = env->num_actors;
+
+    fprintf(stderr, "[PufferDrive] prepare_demo_slots: +%d slots (%d total free, num_actors=%d)\n",
+            n_new, env->demo_n_free_slots, env->num_actors);
+    fflush(stderr);
+}
+
+// Park all demo slots and rebuild the free-entity stack.
+// Call before re-injecting (e.g. after resimulate). Count restoration automatically
+// truncates injected agents from the index arrays.
+void reset_demo_slots(Drive *env) {
+    if (env->demo_n_total_slots == 0) return;
+    fprintf(stderr,
+        "[RESET_DEMO] n_total=%d orig_active=%d orig_static=%d orig_actors=%d\n",
+        env->demo_n_total_slots,
+        env->orig_active_agent_count, env->orig_static_agent_count, env->orig_num_actors);
+    fflush(stderr);
+
+    // Park every demo entity regardless of injection status.
+    for (int k = 0; k < env->demo_n_total_slots; k++) {
+        Entity *e = &env->entities[env->demo_slot_base + k];
+        for (int i = 0; i < e->array_size; i++) {
+            e->traj_x[i]     = INVALID_POSITION;
+            e->traj_y[i]     = INVALID_POSITION;
+            e->traj_valid[i] = 1;
+        }
+        e->x = INVALID_POSITION; e->y = INVALID_POSITION; e->z = 0.0f;
+        e->vx = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+        e->heading = 0.0f; e->heading_x = 1.0f; e->heading_y = 0.0f;
+        e->removed = 0; e->stopped = 1; e->collision_state = 0; e->mark_as_expert = 0;
+        e->active_agent = 0; e->respawn_timestep = -1;
+        e->current_goal_reached = 0; e->collided_before_goal = 0;
+        e->goals_reached_this_episode = 0.0f; e->goals_sampled_this_episode = 1.0f;
+    }
+
+    // Restore counts to post-prepare baseline.
+    // This truncates injected demo agents from active/static/expert index arrays.
+    env->active_agent_count        = env->orig_active_agent_count;
+    env->static_agent_count        = env->orig_static_agent_count;
+    env->expert_static_agent_count = env->orig_expert_static_agent_count;
+    env->num_actors                = env->orig_num_actors;
+
+    drive_assert_actor_invariant(env, "reset_demo_slots");
+
+    // Rebuild the free-entity stack (all demo entities are now free).
+    // demo_free_entity_indices is sized to MAX_AGENTS; never push past it.
+    int n_free = env->demo_n_total_slots;
+    if (n_free > MAX_AGENTS) {
+        fprintf(stderr,
+            "[PufferDrive][BUG] reset_demo_slots: demo_n_total_slots=%d > MAX_AGENTS=%d (clamping)\n",
+            env->demo_n_total_slots, MAX_AGENTS);
+        fflush(stderr);
+        n_free = MAX_AGENTS;
+    }
+    env->demo_n_free_slots = 0;
+    for (int k = 0; k < n_free; k++)
+        env->demo_free_entity_indices[env->demo_n_free_slots++] = env->demo_slot_base + k;
+}
+
+// Place an active (policy-controlled) user car into a free shared demo slot.
+// Returns the slot index k (entity = demo_slot_base + k) or -1 if the pool is full.
+int inject_demo_active_agent(Drive *env, float world_x, float world_y, float heading,
+                             float goal_x, float goal_y,
+                             float length, float width) {
+    if (env->demo_n_free_slots <= 0) {
+        fprintf(stderr, "[PufferDrive] inject_demo_active_agent: no free demo slots\n");
+        fflush(stderr);
+        return -1;
+    }
+    int eidx = env->demo_free_entity_indices[--env->demo_n_free_slots];
+    Entity *e = &env->entities[eidx];
+
+    env->active_agent_indices[env->active_agent_count++] = eidx;
+    env->num_actors++;
+
+    int step = env->init_steps;
+    if (step >= e->array_size) step = e->array_size - 1;
+    if (step < 0) step = 0;
+    float lx = world_x - env->world_mean_x;
+    float ly = world_y - env->world_mean_y;
+    e->x = lx; e->y = ly; e->z = 0.0f;
+    e->vx = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+    e->heading = heading;
+    e->heading_x = cosf(heading); e->heading_y = sinf(heading);
+    e->goal_position_x = goal_x - env->world_mean_x;
+    e->goal_position_y = goal_y - env->world_mean_y;
+    e->goal_position_z = 0.0f;
+    e->init_goal_x = e->goal_position_x;
+    e->init_goal_y = e->goal_position_y;
+    if (length > 0.0f) { e->length = length; e->wheelbase = 0.6f * length; }
+    if (width  > 0.0f) e->width = width;
+    e->valid = 1; e->active_agent = 1; e->removed = 0; e->stopped = 0;
+    e->collision_state = 0; e->mark_as_expert = 0; e->respawn_timestep = -1;
+    e->current_goal_reached = 0; e->collided_before_goal = 0;
+    e->goals_reached_this_episode = 0.0f; e->goals_sampled_this_episode = 1.0f;
+    e->a_long = 0.0f; e->a_lat = 0.0f; e->jerk_long = 0.0f; e->jerk_lat = 0.0f;
+    e->traj_x[step] = lx; e->traj_y[step] = ly;
+    e->traj_vx[step] = 0.0f; e->traj_vy[step] = 0.0f; e->traj_vz[step] = 0.0f;
+    e->traj_heading[step] = heading; e->traj_valid[step] = 1;
+    return eidx - env->demo_slot_base;
+}
+
+// Place a static (non-moving) user car into a free shared demo slot.
+// Returns the slot index k or -1 if no free slots.
+int inject_demo_static_agent(Drive *env, float world_x, float world_y, float heading,
+                             float length, float width) {
+    if (env->demo_n_free_slots <= 0) {
+        fprintf(stderr, "[PufferDrive] inject_demo_static_agent: no free demo slots\n");
+        fflush(stderr);
+        return -1;
+    }
+    int eidx = env->demo_free_entity_indices[--env->demo_n_free_slots];
+    Entity *e = &env->entities[eidx];
+    if (length > 0.0f) { e->length = length; e->wheelbase = 0.6f * length; }
+    if (width  > 0.0f) e->width = width;
+
+    int sa_slot = env->static_agent_count;
+    env->static_agent_indices[env->static_agent_count++] = eidx;
+    env->num_actors++;
+
+    float lx = world_x - env->world_mean_x;
+    float ly = world_y - env->world_mean_y;
+    e->x = lx; e->y = ly; e->z = 0.0f;
+    fprintf(stderr,
+        "[INJECT_STATIC] world=(%.2f,%.2f) mean=(%.2f,%.2f) local=(%.2f,%.2f) "
+        "eidx=%d slot_k=%d sa_slot=%d static_count_after=%d num_actors=%d\n",
+        world_x, world_y, env->world_mean_x, env->world_mean_y, lx, ly,
+        eidx, (int)(eidx - env->demo_slot_base), sa_slot,
+        env->static_agent_count, env->num_actors);
+    fflush(stderr);
+    e->vx = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+    e->heading = heading;
+    e->heading_x = cosf(heading); e->heading_y = sinf(heading);
+    e->valid = 1; e->active_agent = 0; e->removed = 0; e->stopped = 1;
+    e->mark_as_expert = 0; e->collision_state = 0; e->respawn_timestep = -1;
+    // Fill the entire trajectory so set_start_position (called by c_reset on every
+    // episode boundary) and move_expert always read the injected position, regardless
+    // of which timestep or init_steps value is active.
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i]       = lx;
+        e->traj_y[i]       = ly;
+        e->traj_vx[i]      = 0.0f;
+        e->traj_vy[i]      = 0.0f;
+        e->traj_vz[i]      = 0.0f;
+        e->traj_heading[i] = heading;
+        e->traj_valid[i]   = 1;
+    }
+    return eidx - env->demo_slot_base;
+}
+
+// Place a user-defined expert-replay agent into a free shared demo slot.
+// The entity is added to static_agent_indices and expert_static_agent_indices so
+// move_expert() drives it each timestep. Call set_demo_expert_traj() afterwards.
+// Returns the slot index k or -1 if no free slots.
+int inject_demo_expert_agent(Drive *env, float world_x, float world_y, float heading,
+                             float length, float width) {
+    if (env->demo_n_free_slots <= 0) {
+        fprintf(stderr, "[PufferDrive] inject_demo_expert_agent: no free demo slots\n");
+        fflush(stderr);
+        return -1;
+    }
+    int eidx = env->demo_free_entity_indices[--env->demo_n_free_slots];
+    Entity *e = &env->entities[eidx];
+    if (length > 0.0f) { e->length = length; e->wheelbase = 0.6f * length; }
+    if (width  > 0.0f) e->width = width;
+
+    env->static_agent_indices[env->static_agent_count++] = eidx;
+    env->expert_static_agent_indices[env->expert_static_agent_count++] = eidx;
+    env->num_actors++;
+    e->mark_as_expert = 1;
+
+    int step = env->init_steps;
+    if (step >= e->array_size) step = e->array_size - 1;
+    if (step < 0) step = 0;
+    float lx = world_x - env->world_mean_x;
+    float ly = world_y - env->world_mean_y;
+    e->traj_x[step] = lx; e->traj_y[step] = ly;
+    if (e->traj_z) e->traj_z[step] = 0.0f;
+    e->traj_heading[step] = heading; e->traj_valid[step] = 1;
+    e->x = lx; e->y = ly; e->z = 0.0f;
+    e->heading = heading; e->heading_x = cosf(heading); e->heading_y = sinf(heading);
+    e->respawn_timestep = -1;
+    e->stopped = 0;  // allow move_expert() to drive this entity along its trajectory
+    return eidx - env->demo_slot_base;
+}
+
+// Set the full trajectory (world-space) for demo slot slot_k (must be an expert slot).
+// xs, ys, headings are arrays of length n (max TRAJECTORY_LENGTH).
+// The function converts world→local and marks all entries valid.
+void set_demo_expert_traj(Drive *env, int slot_k,
+                          float *world_xs, float *world_ys, float *headings, int n) {
+    if (slot_k < 0 || slot_k >= env->demo_n_total_slots) return;
+    int idx = env->demo_slot_base + slot_k;
+    Entity *e = &env->entities[idx];
+    // Invalidate everything first
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i] = INVALID_POSITION;
+        e->traj_y[i] = INVALID_POSITION;
+        e->traj_valid[i] = 0;
+    }
+    int max_n = (n < e->array_size) ? n : e->array_size;
+    for (int i = 0; i < max_n; i++) {
+        e->traj_x[i] = world_xs[i] - env->world_mean_x;
+        e->traj_y[i] = world_ys[i] - env->world_mean_y;
+        if (e->traj_z) e->traj_z[i] = 0.0f;
+        e->traj_heading[i] = headings[i];
+        e->traj_valid[i] = 1;
+    }
+    // Set current position to init_steps position
+    int step = env->init_steps;
+    if (step >= max_n) step = (max_n > 0) ? max_n - 1 : 0;
+    if (max_n > 0) {
+        e->x = e->traj_x[step];
+        e->y = e->traj_y[step];
+        if (e->traj_z) e->z = e->traj_z[step];
+        e->heading = e->traj_heading[step];
+        e->heading_x = cosf(e->heading);
+        e->heading_y = sinf(e->heading);
+    }
+}
+
+// Remove an active-agent slot from the pool permanently (for this episode).
+// Call after reset() to detach scene agents the user has removed, freeing space
+// for demo slots in scenes that would otherwise be at MAX_AGENTS capacity.
+// Slot indices must be passed in DESCENDING order to avoid index shifting errors.
+void c_detach_active_agent(Drive *env, int slot_idx) {
+    if (slot_idx < 0 || slot_idx >= env->active_agent_count) return;
+    int eidx = env->active_agent_indices[slot_idx];
+    fprintf(stderr,
+        "[DETACH] slot_idx=%d eidx=%d active_before=%d num_actors_before=%d\n",
+        slot_idx, eidx, env->active_agent_count, env->num_actors);
+    fflush(stderr);
+    Entity *e = &env->entities[eidx];
+    // Zero trajectory so set_start_position (called by c_reset) keeps this entity
+    // permanently invisible — no need to re-apply the detach on subsequent resets.
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i]     = INVALID_POSITION;
+        e->traj_y[i]     = INVALID_POSITION;
+        e->traj_valid[i] = 0;
+    }
+    e->x = INVALID_POSITION; e->y = INVALID_POSITION;
+    e->valid = 0; e->active_agent = 0; e->stopped = 1;
+    // Shift left to close the gap.
+    for (int j = slot_idx; j < env->active_agent_count - 1; j++)
+        env->active_agent_indices[j] = env->active_agent_indices[j + 1];
+    if (env->active_agent_count > 0) env->active_agent_count--;
+    if (env->num_actors > 0) env->num_actors--;
+    drive_assert_actor_invariant(env, "c_detach_active_agent");
+}
+
+// Remove a non-expert static agent slot from the pool permanently (for this episode).
+// IMPORTANT: the argument is the index in the NON-EXPERT static output order, i.e. the
+// same index produced by c_get_static_agent_state (which skips experts) — NOT the raw
+// static_agent_indices position. Experts are dual-tracked in static_agent_indices, so
+// the two index spaces differ; we translate here so the caller (the demo, which only
+// ever sees non-expert statics) removes exactly the static it clicked.
+void c_detach_static_agent(Drive *env, int nonexpert_idx) {
+    if (nonexpert_idx < 0) return;
+    int slot_idx = -1, _count = 0;
+    for (int i = 0; i < env->static_agent_count; i++) {
+        if (env->entities[env->static_agent_indices[i]].mark_as_expert == 1) continue;
+        if (_count == nonexpert_idx) { slot_idx = i; break; }
+        _count++;
+    }
+    if (slot_idx < 0) return;
+    int eidx = env->static_agent_indices[slot_idx];
+    Entity *e = &env->entities[eidx];
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i]     = INVALID_POSITION;
+        e->traj_y[i]     = INVALID_POSITION;
+        e->traj_valid[i] = 0;
+    }
+    e->x = INVALID_POSITION; e->y = INVALID_POSITION;
+    e->valid = 0; e->stopped = 1; e->mark_as_expert = 0;
+    for (int j = slot_idx; j < env->static_agent_count - 1; j++)
+        env->static_agent_indices[j] = env->static_agent_indices[j + 1];
+    if (env->static_agent_count > 0) env->static_agent_count--;
+    // A native static may also be dual-tracked as an expert (mark_as_expert or
+    // overflow in set_active_agents). Remove it from expert_static_agent_indices too,
+    // otherwise the entry dangles at a now-invalidated entity and move_expert /
+    // ghost-replay loops over expert_static_agent_count touch a recycled slot.
+    for (int j = 0; j < env->expert_static_agent_count; j++) {
+        if (env->expert_static_agent_indices[j] == eidx) {
+            for (int k = j; k < env->expert_static_agent_count - 1; k++)
+                env->expert_static_agent_indices[k] = env->expert_static_agent_indices[k + 1];
+            env->expert_static_agent_count--;
+            break;
+        }
+    }
+    if (env->num_actors > 0) env->num_actors--;
+    drive_assert_actor_invariant(env, "c_detach_static_agent");
+}
+
+// Remove an expert static agent slot from the pool permanently (for this episode).
+// Mirrors c_detach_active_agent but operates on expert_static_agent_indices.
+// Slot indices must be passed in DESCENDING order.
+void c_detach_expert_agent(Drive *env, int slot_idx) {
+    if (slot_idx < 0 || slot_idx >= env->expert_static_agent_count) return;
+    int eidx = env->expert_static_agent_indices[slot_idx];
+    Entity *e = &env->entities[eidx];
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i]     = INVALID_POSITION;
+        e->traj_y[i]     = INVALID_POSITION;
+        e->traj_valid[i] = 0;
+    }
+    e->x = INVALID_POSITION; e->y = INVALID_POSITION;
+    e->valid = 0; e->stopped = 1;
+    for (int j = slot_idx; j < env->expert_static_agent_count - 1; j++)
+        env->expert_static_agent_indices[j] = env->expert_static_agent_indices[j + 1];
+    if (env->expert_static_agent_count > 0) env->expert_static_agent_count--;
+    // Experts are tracked in static_agent_indices as well; remove the entry there too,
+    // otherwise num_actors falls below active_agent_count + static_agent_count and the
+    // collision_check / compute_observations loops silently skip the tail of
+    // static_agent_indices (where newly injected demo statics live).
+    for (int j = 0; j < env->static_agent_count; j++) {
+        if (env->static_agent_indices[j] == eidx) {
+            for (int k = j; k < env->static_agent_count - 1; k++)
+                env->static_agent_indices[k] = env->static_agent_indices[k + 1];
+            env->static_agent_count--;
+            break;
+        }
+    }
+    if (env->num_actors > 0) env->num_actors--;
+    drive_assert_actor_invariant(env, "c_detach_expert_agent");
+}
+
+// Reposition a non-expert static agent in place, keeping its slot/identity (no detach,
+// no index shift). nonexpert_idx is the index in the NON-EXPERT static output order
+// (same index space as c_detach_static_agent / c_get_static_agent_state). Updates the
+// live position, heading, and the full trajectory so it survives c_reset.
+void c_teleport_static_agent(Drive *env, int nonexpert_idx, float world_x, float world_y, float heading) {
+    if (nonexpert_idx < 0) return;
+    int slot_idx = -1, _count = 0;
+    for (int i = 0; i < env->static_agent_count; i++) {
+        if (env->entities[env->static_agent_indices[i]].mark_as_expert == 1) continue;
+        if (_count == nonexpert_idx) { slot_idx = i; break; }
+        _count++;
+    }
+    if (slot_idx < 0) return;
+    int eidx = env->static_agent_indices[slot_idx];
+    Entity *e = &env->entities[eidx];
+    float lx = world_x - env->world_mean_x;
+    float ly = world_y - env->world_mean_y;
+    e->x = lx; e->y = ly;
+    e->heading = heading;
+    e->heading_x = cosf(heading); e->heading_y = sinf(heading);
+    e->vx = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+    e->valid = 1; e->stopped = 1; e->removed = 0;
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i]       = lx;
+        e->traj_y[i]       = ly;
+        e->traj_vx[i]      = 0.0f;
+        e->traj_vy[i]      = 0.0f;
+        e->traj_vz[i]      = 0.0f;
+        e->traj_heading[i] = heading;
+        e->traj_valid[i]   = 1;
+    }
+}
+
+// Reposition an expert agent in place by replacing its trajectory, keeping its slot.
+// expert_idx is the index in expert_static_agent_indices (same space as
+// c_detach_expert_agent). Mirrors set_demo_expert_traj but targets a native expert.
+void c_teleport_expert_agent(Drive *env, int expert_idx,
+                             float *world_xs, float *world_ys, float *headings, int n) {
+    if (expert_idx < 0 || expert_idx >= env->expert_static_agent_count) return;
+    int eidx = env->expert_static_agent_indices[expert_idx];
+    Entity *e = &env->entities[eidx];
+    for (int i = 0; i < e->array_size; i++) {
+        e->traj_x[i] = INVALID_POSITION;
+        e->traj_y[i] = INVALID_POSITION;
+        e->traj_valid[i] = 0;
+    }
+    int max_n = (n < e->array_size) ? n : e->array_size;
+    for (int i = 0; i < max_n; i++) {
+        e->traj_x[i] = world_xs[i] - env->world_mean_x;
+        e->traj_y[i] = world_ys[i] - env->world_mean_y;
+        if (e->traj_z) e->traj_z[i] = 0.0f;
+        e->traj_heading[i] = headings[i];
+        e->traj_valid[i] = 1;
+    }
+    int step = env->init_steps;
+    if (step >= max_n) step = (max_n > 0) ? max_n - 1 : 0;
+    if (max_n > 0) {
+        e->x = e->traj_x[step];
+        e->y = e->traj_y[step];
+        if (e->traj_z) e->z = e->traj_z[step];
+        e->heading = e->traj_heading[step];
+        e->heading_x = cosf(e->heading);
+        e->heading_y = sinf(e->heading);
+        e->valid = 1; e->removed = 0;
+    }
+}
+
+void c_reset_injections(Drive *env) {
+    // Restore index counts to original post-init values, discarding all injected agents.
+    for (int i = env->orig_active_agent_count; i < env->active_agent_count; i++)
+        env->entities[env->active_agent_indices[i]].active_agent = 0;
+    env->active_agent_count        = env->orig_active_agent_count;
+    env->static_agent_count        = env->orig_static_agent_count;
+    env->expert_static_agent_count = env->orig_expert_static_agent_count;
+    env->num_actors                = env->orig_num_actors;
+    // Rebuild demo free stack so demo_n_free_slots == MAX_AGENTS - num_actors.
+    if (env->demo_n_total_slots > 0 && env->demo_free_entity_indices) {
+        env->demo_n_free_slots = 0;
+        for (int k = 0; k < env->demo_n_total_slots; k++)
+            env->demo_free_entity_indices[env->demo_n_free_slots++] = env->demo_slot_base + k;
+    }
+    // Restore removed/stopped for original active agents: c_reset's compute_agent_metrics
+    // may have spuriously removed agents because stale injected static cars were still in
+    // static_agent_indices at their trajectory positions.
+    for (int i = 0; i < env->orig_active_agent_count; i++) {
+        Entity *e = &env->entities[env->active_agent_indices[i]];
+        e->removed = 0;
+        e->stopped = 0;
+    }
+    // Re-park reserved slots: restore position, active_agent=1 (blocks spare search),
+    // and removed=1 (marks slot as available for next injection).
+    for (int k = 0; k < env->n_reserved_slots; k++) {
+        Entity *e = &env->entities[env->reserved_slot_entities[k]];
+        e->x = PARKED_X; e->y = PARKED_Y;
+        e->active_agent = 1; e->removed = 1; e->stopped = 0;
+    }
+}
 
 void c_close(Drive *env) {
-    if (env->client != NULL) {
-        close_client(env->client);
-        env->client = NULL;
-    }
     for (int i = 0; i < env->num_entities; i++) {
         free_entity(&env->entities[i]);
     }
     free(env->entities);
     free(env->active_agent_indices);
     free(env->logs);
+    if (env->reserved_slot_entities) free(env->reserved_slot_entities);
     // GridMap cleanup
     int grid_cell_count = env->grid_map->grid_cols * env->grid_map->grid_rows;
     for (int grid_index = 0; grid_index < grid_cell_count; grid_index++) {
@@ -1501,9 +2026,8 @@ void c_close(Drive *env) {
     free(env->grid_map);
     free(env->static_agent_indices);
     free(env->expert_static_agent_indices);
+    if (env->demo_free_entity_indices) free(env->demo_free_entity_indices);
     free(env->ini_file);
-    free(env->tracks_to_predict_indices);
-    env->tracks_to_predict_indices = NULL;
 }
 
 void allocate(Drive *env) {
@@ -1720,16 +2244,16 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
     return;
 }
 
-static inline int is_in_track_to_predicts(Drive *env, int agent_idx) {
+static inline int get_track_id_or_placeholder(Drive *env, int agent_idx) {
     if (env->tracks_to_predict_indices == NULL || env->num_tracks_to_predict == 0) {
-        return 0;
+        return -1;
     }
     for (int k = 0; k < env->num_tracks_to_predict; k++) {
         if (env->tracks_to_predict_indices[k] == agent_idx) {
-            return 1;
+            return env->tracks_to_predict_indices[k];
         }
     }
-    return 0;
+    return -1;
 }
 
 void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_out, float *heading_out, int *id_out,
@@ -1737,30 +2261,300 @@ void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_o
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
         Entity *agent = &env->entities[agent_idx];
-
-        // For WOSAC, we need the original world coordinates, so we add the world means back
-        x_out[i] = agent->x + env->world_mean_x;
-        y_out[i] = agent->y + env->world_mean_y;
+        // Removed/invalid agents sit at INVALID_POSITION locally; skip world_mean so the
+        // viewer's abs(x) < 9000 filter always catches them regardless of world_mean value.
+        if (agent->x <= INVALID_POSITION) {
+            x_out[i] = INVALID_POSITION;
+            y_out[i] = INVALID_POSITION;
+        } else {
+            x_out[i] = agent->x + env->world_mean_x;
+            y_out[i] = agent->y + env->world_mean_y;
+        }
         z_out[i] = agent->z;
         heading_out[i] = agent->heading;
-        id_out[i] = agent->id;
+        id_out[i] = (agent_idx == env->sdc_track_index) ? -2 : get_track_id_or_placeholder(env, agent_idx);
         length_out[i] = agent->length;
         width_out[i] = agent->width;
     }
 }
 
-void c_get_global_ground_truth_trajectories(Drive *env, float *x_out, float *y_out, float *z_out, float *heading_out,
-                                            int *valid_out, int *id_out, bool *is_vehicle_out,
-                                            bool *is_track_to_predict_out, char *scenario_id_out) {
+// Status codes returned by c_get_agent_statuses
+#define AGENT_STATUS_RUNNING      0
+#define AGENT_STATUS_PAUSED       1  // stopped=1 but not removed
+#define AGENT_STATUS_CRASHED      2  // vehicle collision → removed/stopped
+#define AGENT_STATUS_OFFROAD      3  // offroad collision → removed/stopped
+#define AGENT_STATUS_GOAL_REACHED 4  // current_goal_reached=1
+
+void c_get_agent_statuses(Drive *env, int *status_out) {
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
         Entity *agent = &env->entities[agent_idx];
-        id_out[i] = agent->id;
-        is_vehicle_out[i] = agent->type == VEHICLE;
-        is_track_to_predict_out[i] = is_in_track_to_predicts(env, agent_idx);
 
-        // The scenario_id is an array of 16 char
-        memcpy(scenario_id_out + (i * 16), env->scenario_id, 16);
+        if (agent->current_goal_reached) {
+            status_out[i] = AGENT_STATUS_GOAL_REACHED;
+        } else if (agent->removed || agent->stopped) {
+            // collision_state and metrics_array are fresh from compute_agent_metrics
+            // this step — read them before the next step resets them.
+            if (agent->metrics_array[OFFROAD_IDX] > 0.0f) {
+                status_out[i] = AGENT_STATUS_OFFROAD;
+            } else if (agent->collision_state) {
+                status_out[i] = AGENT_STATUS_CRASHED;
+            } else {
+                // fallback: distinguish via stopped vs removed if reason unclear
+                status_out[i] = agent->stopped ? AGENT_STATUS_PAUSED : AGENT_STATUS_CRASHED;
+            }
+        } else {
+            status_out[i] = AGENT_STATUS_RUNNING;
+        }
+    }
+}
+
+int c_get_expert_agent_count(Drive *env) {
+    return env->expert_static_agent_count;
+}
+
+int c_get_active_agent_count(Drive *env) {
+    return env->active_agent_count;
+}
+
+// Inject a new policy-controlled vehicle by hijacking an inactive VEHICLE entity.
+// Pass WORLD coordinates (world_mean already added back). Returns 0 on success,
+// -2 if MAX_AGENTS cap hit, -3 if no inactive vehicle slot found.
+int inject_active_agent(Drive *env, float world_x, float world_y, float heading,
+                        float goal_x, float goal_y) {
+    if (env->active_agent_count >= MAX_AGENTS) return -2;
+    int host_idx = -1;
+    int host_was_spare = 0;
+    // Use a pre-reserved parked slot if available (most robust path)
+    for (int k = 0; k < env->n_reserved_slots; k++) {
+        int ridx = env->reserved_slot_entities[k];
+        if (env->entities[ridx].removed == 1) {
+            host_idx = ridx;
+            host_was_spare = 1;  // not in any list yet; must be counted in num_actors on injection
+            break;
+        }
+    }
+    // Fallback: find a spare vehicle entity not in any list
+    if (host_idx < 0) for (int i = 0; i < env->num_objects; i++) {
+        Entity *e = &env->entities[i];
+        if (e->type != VEHICLE) continue;
+        if (e->active_agent == 1) continue;
+        int in_any = 0;
+        for (int j = 0; j < env->expert_static_agent_count && !in_any; j++)
+            if (env->expert_static_agent_indices[j] == i) in_any = 1;
+        for (int j = 0; j < env->static_agent_count && !in_any; j++)
+            if (env->static_agent_indices[j] == i) in_any = 1;
+        if (!in_any) { host_idx = i; host_was_spare = 1; break; }
+    }
+    // Fallback: take from expert list (already counted in num_actors via static_agent_count)
+    if (host_idx < 0) return -3;
+
+    // Remove host from expert_static list so move_expert() won't override its position
+    for (int j = 0; j < env->expert_static_agent_count; j++) {
+        if (env->expert_static_agent_indices[j] == host_idx) {
+            fprintf(stderr, "Injected over an expert\n");
+            fflush(stderr);
+            for (int k = j; k < env->expert_static_agent_count - 1; k++)
+                env->expert_static_agent_indices[k] = env->expert_static_agent_indices[k + 1];
+            env->expert_static_agent_count--;
+            break;
+        }
+    }
+    // Remove host from static list as well
+    for (int j = 0; j < env->static_agent_count; j++) {
+        if (env->static_agent_indices[j] == host_idx) {
+            printf("Injected over an expert");
+            for (int k = j; k < env->static_agent_count - 1; k++)
+                env->static_agent_indices[k] = env->static_agent_indices[k + 1];
+            env->static_agent_count--;
+            break;
+        }
+    }
+
+    Entity *e = &env->entities[host_idx];
+    e->x            = world_x - env->world_mean_x;
+    e->y            = world_y - env->world_mean_y;
+    e->z            = 0.0f;
+    e->vx           = 0.0f;
+    e->vy           = 0.0f;
+    e->vz           = 0.0f;
+    e->heading      = heading;
+    e->heading_x    = cosf(heading);
+    e->heading_y    = sinf(heading);
+    e->goal_position_x = goal_x - env->world_mean_x;
+    e->goal_position_y = goal_y - env->world_mean_y;
+    e->goal_position_z = 0.0f;
+    e->init_goal_x  = e->goal_position_x;
+    e->init_goal_y  = e->goal_position_y;
+    e->valid         = 1;
+    e->active_agent  = 1;
+    e->removed       = 0;
+    e->stopped       = 0;
+    e->current_goal_reached = 0;
+    e->mark_as_expert = 0;
+    e->collision_state = 0;
+    e->collided_before_goal = 0;
+    e->goals_reached_this_episode = 0.0f;
+    e->goals_sampled_this_episode = 1.0f;
+    e->a_long = 0.0f; e->a_lat = 0.0f;
+    e->jerk_long = 0.0f; e->jerk_lat = 0.0f;
+    if (e->length <= 0.0f) e->length = 4.5f;
+    if (e->width  <= 0.0f) e->width  = 2.0f;
+    for (int k = 0; k < 5; k++) e->metrics_array[k] = 0.0f;
+
+    int new_count = env->active_agent_count + 1;
+    env->active_agent_indices =
+        (int *)realloc(env->active_agent_indices, new_count * sizeof(int));
+    env->active_agent_indices[env->active_agent_count] = host_idx;
+    env->logs = (Log *)realloc(env->logs, new_count * sizeof(Log));
+    memset(&env->logs[env->active_agent_count], 0, sizeof(Log));
+    env->logs_capacity = new_count;
+    env->active_agent_count = new_count;
+    printf("Injected!");
+    // Keep num_actors = active_agent_count + static_agent_count invariant.
+    // Spare entities were not previously counted; list entities already were.
+    if (host_was_spare)
+        env->num_actors++;
+    return 0;
+}
+
+int inject_static_agent(Drive *env, float world_x, float world_y, float heading) {
+    // Prefer a pre-reserved parked slot (same pool as inject_active_agent)
+    int host_idx = -1;
+    for (int k = 0; k < env->n_reserved_slots; k++) {
+        int ridx = env->reserved_slot_entities[k];
+        if (env->entities[ridx].removed == 1) { host_idx = ridx; break; }
+    }
+    // Fallback: find a spare vehicle entity not currently in any list
+    if (host_idx < 0) for (int i = 0; i < env->num_objects; i++) {
+        Entity *e = &env->entities[i];
+        if (e->type != VEHICLE) continue;
+        if (e->active_agent == 1) continue;
+        int in_any = 0;
+        for (int j = 0; j < env->expert_static_agent_count && !in_any; j++)
+            if (env->expert_static_agent_indices[j] == i) in_any = 1;
+        for (int j = 0; j < env->static_agent_count && !in_any; j++)
+            if (env->static_agent_indices[j] == i) in_any = 1;
+        fprintf(stderr, "Wanted to replace a static car by a static car\n");
+        fflush(stderr);
+        if (!in_any) { host_idx = i; break; }
+
+    }
+    // No expert-list fallback: background cars must never be displaced.
+    if (host_idx < 0) return -3;
+
+    Entity *e = &env->entities[host_idx];
+    float cx = world_x - env->world_mean_x;
+    float cy = world_y - env->world_mean_y;
+    e->x            = cx;
+    e->y            = cy;
+    e->z            = 0.0f;
+    e->vx           = 0.0f; e->vy = 0.0f; e->vz = 0.0f;
+    e->heading      = heading;
+    e->heading_x    = cosf(heading);
+    e->heading_y    = sinf(heading);
+    e->valid        = 1;
+    e->active_agent = 0;
+    e->removed      = 0;
+    e->stopped      = 0;
+    e->mark_as_expert = 1;
+    e->collision_state = 0;
+    if (e->length <= 0.0f) e->length = 4.5f;
+    if (e->width  <= 0.0f) e->width  = 2.0f;
+    // Write into traj slot 0 so set_start_position (called by c_reset on episode
+    // truncation) resets back to the injected position rather than the original
+    // map trajectory, which would silently move the obstacle away mid-simulation.
+    if (e->array_size > 0) {
+        e->traj_x[0]       = cx;
+        e->traj_y[0]       = cy;
+        e->traj_z[0]       = 0.0f;
+        e->traj_vx[0]      = 0.0f;
+        e->traj_vy[0]      = 0.0f;
+        e->traj_vz[0]      = 0.0f;
+        e->traj_heading[0] = heading;
+        e->traj_valid[0]   = 1;
+    }
+    fprintf(stderr, "added a static car\n");
+    fflush(stderr);
+    int new_count = env->static_agent_count + 1;
+    env->static_agent_indices =
+        (int *)realloc(env->static_agent_indices, new_count * sizeof(int));
+    env->static_agent_indices[env->static_agent_count] = host_idx;
+    env->static_agent_count = new_count;
+    // num_actors gates both collision_check and compute_observations loops
+    env->num_actors++;
+    return 0;
+}
+
+void c_teleport_agent(Drive *env, int active_slot, float world_x, float world_y,
+                      float heading, float goal_x, float goal_y) {
+    if (active_slot < 0 || active_slot >= env->active_agent_count) return;
+    int idx = env->active_agent_indices[active_slot];
+    Entity *e = &env->entities[idx];
+    e->x = world_x - env->world_mean_x;
+    e->y = world_y - env->world_mean_y;
+    e->heading = heading;
+    e->heading_x = cosf(heading);
+    e->heading_y = sinf(heading);
+    e->vx = 0.0f;
+    e->vy = 0.0f;
+    e->vz = 0.0f;
+    e->goal_position_x = goal_x - env->world_mean_x;
+    e->goal_position_y = goal_y - env->world_mean_y;
+    e->valid = 1;
+    e->removed = 0;
+    e->stopped = 0;
+    e->current_goal_reached = 0;
+    reset_agent_metrics(env, idx);
+}
+
+void c_get_expert_agent_state(Drive *env, float *x_out, float *y_out, float *heading_out,
+                              float *length_out, float *width_out) {
+    for (int i = 0; i < env->expert_static_agent_count; i++) {
+        int idx = env->expert_static_agent_indices[i];
+        Entity *agent = &env->entities[idx];
+        if (agent->x <= INVALID_POSITION) {
+            x_out[i] = INVALID_POSITION;
+            y_out[i] = INVALID_POSITION;
+        } else {
+            x_out[i] = agent->x + env->world_mean_x;
+            y_out[i] = agent->y + env->world_mean_y;
+        }
+        heading_out[i] = agent->heading;
+        length_out[i] = agent->length;
+        width_out[i] = agent->width;
+    }
+}
+
+int c_get_static_agent_count(Drive *env) {
+    return env->static_agent_count - env->expert_static_agent_count;
+}
+
+void c_get_static_agent_state(Drive *env, float *x_out, float *y_out, float *heading_out,
+                              float *length_out, float *width_out) {
+    int out_idx = 0;
+    for (int i = 0; i < env->static_agent_count; i++) {
+        int idx = env->static_agent_indices[i];
+        if (env->entities[idx].mark_as_expert == 1) continue;
+        Entity *agent = &env->entities[idx];
+        float wx = agent->x + env->world_mean_x;
+        float wy = agent->y + env->world_mean_y;
+        x_out[out_idx] = wx;
+        y_out[out_idx] = wy;
+        heading_out[out_idx] = agent->heading;
+        length_out[out_idx] = agent->length;
+        width_out[out_idx] = agent->width;
+        out_idx++;
+    }
+}
+
+void c_get_global_ground_truth_trajectories(Drive *env, float *x_out, float *y_out, float *z_out, float *heading_out,
+                                            int *valid_out, int *id_out, int *scenario_id_out) {
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        Entity *agent = &env->entities[agent_idx];
+        id_out[i] = get_track_id_or_placeholder(env, agent_idx);
+        scenario_id_out[i] = agent->scenario_id;
 
         for (int t = env->init_steps; t < agent->array_size; t++) {
             int out_idx = i * (agent->array_size - env->init_steps) + (t - env->init_steps);
@@ -1786,16 +2580,42 @@ void c_get_road_edge_counts(Drive *env, int *num_polylines_out, int *total_point
     *total_points_out = points;
 }
 
-void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *lengths_out, char *scenario_ids_out) {
+void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *lengths_out, int *scenario_ids_out) {
     int poly_idx = 0, pt_idx = 0;
     for (int i = env->num_objects; i < env->num_entities; i++) {
         Entity *e = &env->entities[i];
         if (e->type == ROAD_EDGE) {
             lengths_out[poly_idx] = e->array_size;
+            scenario_ids_out[poly_idx] = e->scenario_id;
+            for (int j = 0; j < e->array_size; j++) {
+                x_out[pt_idx] = e->traj_x[j] + env->world_mean_x;
+                y_out[pt_idx] = e->traj_y[j] + env->world_mean_y;
+                pt_idx++;
+            }
+            poly_idx++;
+        }
+    }
+}
 
-            char *scenario_id_ptr = scenario_ids_out + poly_idx * 16;
-            memcpy(scenario_id_ptr, env->scenario_id, 16);
+void c_get_lane_counts(Drive *env, int *num_polylines_out, int *total_points_out) {
+    int count = 0, points = 0;
+    for (int i = env->num_objects; i < env->num_entities; i++) {
+        if (env->entities[i].type == ROAD_LANE) {
+            count++;
+            points += env->entities[i].array_size;
+        }
+    }
+    *num_polylines_out = count;
+    *total_points_out = points;
+}
 
+void c_get_lane_polylines(Drive *env, float *x_out, float *y_out, int *lengths_out, int *scenario_ids_out) {
+    int poly_idx = 0, pt_idx = 0;
+    for (int i = env->num_objects; i < env->num_entities; i++) {
+        Entity *e = &env->entities[i];
+        if (e->type == ROAD_LANE) {
+            lengths_out[poly_idx] = e->array_size;
+            scenario_ids_out[poly_idx] = e->scenario_id;
             for (int j = 0; j < e->array_size; j++) {
                 x_out[pt_idx] = e->traj_x[j] + env->world_mean_x;
                 y_out[pt_idx] = e->traj_y[j] + env->world_mean_y;
@@ -1845,21 +2665,18 @@ void compute_observations(Drive *env) {
                 (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
             obs[8] = ego_entity->a_lat / JERK_LAT[2];
             obs[9] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
-            // Add normalized entity type (VEHICLE=1, PEDESTRIAN=2, CYCLIST=3)
-            obs[10] = ego_entity->type / 3.0f;
         } else {
             obs[6] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
-            obs[7] = ego_entity->type / 3.0f;
         }
 
         // Relative Pos of other cars
         int obs_idx = ego_dim;
         int cars_seen = 0;
-        for (int j = 0; j < MAX_AGENTS; j++) {
+        for (int j = 0; j < env->num_actors; j++) {
             int index = -1;
             if (j < env->active_agent_count) {
                 index = env->active_agent_indices[j];
-            } else if (j < env->num_actors && env->static_agent_count > 0) {
+            } else {
                 index = env->static_agent_indices[j - env->active_agent_count];
             }
             if (index == -1)
@@ -2030,6 +2847,9 @@ void sample_new_goal(Drive *env, int agent_idx) {
 
 void c_reset(Drive *env) {
     env->timestep = env->init_steps;
+    // TODO: check if this is correct here
+    // memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
+    
     set_start_position(env);
     for (int x = 0; x < env->active_agent_count; x++) {
         env->logs[x] = (Log){0};
@@ -2053,7 +2873,7 @@ void c_reset(Drive *env) {
             env->entities[agent_idx].goal_position_y = env->entities[agent_idx].init_goal_y;
         }
 
-        compute_agent_metrics(env, agent_idx);
+        compute_agent_metrics(env, agent_idx, x);
     }
     compute_observations(env);
 }
@@ -2083,20 +2903,59 @@ void respawn_agent(Drive *env, int agent_idx) {
 }
 
 void c_step(Drive *env) {
+    /*
+    This function generally consists of 5 components:
+    1. reset environment, if episode length is reached or termination_mode is set to 1 and all agents got already either respawned, stopped or removed
+    2. move expert and active cars + jerk reward
+    3. compute rewards for each agent -> does not reset individual agents to not disturb reward calculation for the following agents in the iteration
+    4. reset individual agents, if reset behavior is set for collision, offroad or goal behavior.
+    5. calculate observation (watch out, if there was termination of the agents, they got reset!)
+    */
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
     env->timestep++;
 
-    // Move static experts
+    int originals_remaining = 0;
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        // Keep flag true if there is at least one agent that has not been respawned yet
+        if ((env->entities[agent_idx].respawn_count + env->entities[agent_idx].stopped + env->entities[agent_idx].removed)  == 0) {
+            originals_remaining = 1;
+            break;
+        }
+        // if (originals_remaining == 0) {
+        //     if (env->termination_mode ==1) {
+        //         printf("There is no correct handling for respawned agents when termination_mode=1, Truncation needs to be set manually!\n");
+        //     }
+        // }
+    }
+
+    if (env->timestep == env->episode_length || (!originals_remaining && env->termination_mode == 1)) {
+        // reset environment -> truncation should be set to 1 in the timestep before!
+        add_log(env);
+        c_reset(env);
+        return;
+    }
+
+    // Move static experts, stopping them permanently if they collide with any injected static car.
+    // Using entity->stopped as a per-expert "frozen" flag: once set, the expert skips move_expert
+    // for the rest of the episode so its trajectory cannot jump past the obstacle later.
+    // set_start_position resets stopped=0 on episode reset, so experts restart cleanly.
     for (int i = 0; i < env->expert_static_agent_count; i++) {
         int expert_idx = env->expert_static_agent_indices[i];
         if (env->entities[expert_idx].x == INVALID_POSITION)
             continue;
         move_expert(env, env->actions, expert_idx);
+
     }
     // Process actions for all active agents
     for (int i = 0; i < env->active_agent_count; i++) {
+        // this only handles truncations at the end of the episode length and not if truncations are caused when all agents are dead.
+        if (env->timestep == (env->episode_length - 1)) {
+            // this is the last step, afterwards the above if clausal will be triggered
+            env->truncations[i] = 1;
+        }
         env->logs[i].score = 0.0f;
         env->logs[i].episode_length += 1;
         int agent_idx = env->active_agent_indices[i];
@@ -2116,14 +2975,17 @@ void c_step(Drive *env) {
         }
     }
 
-    // Compute rewards
+    // Compute rewards and only rewards!! Do not replace agents here, to not break the correct reward calculation for the following agents in the iteration.
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
         env->entities[agent_idx].collision_state = 0;
-
-        compute_agent_metrics(env, agent_idx);
+        if (env->entities[agent_idx].removed == 1 || env->entities[agent_idx].stopped == 1) { // if the agents got removed/stopped in a step before, they should not get any reward in the upfollowing step, continue here. 
+            env->terminals[i] = 1;
+            continue;
+        }
+        compute_agent_metrics(env, agent_idx, i); // sets collision_state/stopped/removed flags for current agent for collision and offroad, not for goal_behavior!
         int collision_state = env->entities[agent_idx].collision_state;
-
+        // is this fair, if the agents get stopped at vehicle collision or going offroad? Do they get negative reward for each timestep afterwards??
         if (collision_state > 0) {
             if (collision_state == VEHICLE_COLLISION) {
                 env->rewards[i] += env->reward_vehicle_collision;
@@ -2152,23 +3014,57 @@ void c_step(Drive *env) {
         bool within_speed = current_speed <= env->goal_speed;
 
         if (within_distance && within_speed && !env->entities[agent_idx].current_goal_reached) {
-            if (env->goal_behavior == GOAL_RESPAWN && env->entities[agent_idx].respawn_timestep != -1) {
-                env->rewards[i] += env->reward_goal_post_respawn;
-                env->logs[i].episode_return += env->reward_goal_post_respawn;
-                env->entities[agent_idx].current_goal_reached = 1;
-            } else if (env->goal_behavior == GOAL_GENERATE_NEW && (!env->entities[agent_idx].current_goal_reached)) {
+            if (env->goal_behavior == GOAL_RESPAWN){
+                if (env->entities[agent_idx].respawn_timestep != -1) {
+                    // if there already was a respawn, there is a discounted goal reward
+                    env->rewards[i] += env->reward_goal_post_respawn;
+                    env->logs[i].episode_return += env->reward_goal_post_respawn;
+                    env->entities[agent_idx].current_goal_reached = 1; // does this mean, this can only happen once? 
+                    env->entities[agent_idx].goals_reached_this_episode += 1.0f;
+                } else {
+                    // general respawn reward
+                    env->rewards[i] += env->reward_goal;
+                    env->logs[i].episode_return += env->reward_goal;    
+                    env->entities[agent_idx].goals_reached_this_episode += 1.0f;               
+                }
+            // if (env->goal_behavior == GOAL_RESPAWN && env->entities[agent_idx].respawn_timestep != -1) {
+            //     env->rewards[i] += env->reward_goal_post_respawn;
+            //     env->logs[i].episode_return += env->reward_goal_post_respawn;
+            //     env->entities[agent_idx].current_goal_reached = 1;
+            } else if (env->goal_behavior == GOAL_GENERATE_NEW) { // always same reward for each reached goal -> is this intended? rather also the discounted reward?
                 env->rewards[i] += env->reward_goal;
                 env->logs[i].episode_return += env->reward_goal;
                 sample_new_goal(env, agent_idx);
                 env->entities[agent_idx].current_goal_reached = 0;
                 env->entities[agent_idx].goals_reached_this_episode += 1.0f;
+            } else if (env->goal_behavior == GOAL_REMOVE) {
+                if (env->entities[agent_idx].removed != 1) { // if removed through collision or offroad just before.
+                    env->rewards[i] += env->reward_goal;
+                    env->logs[i].episode_return += env->reward_goal;
+                    env->entities[agent_idx].removed = 1;
+                    env->entities[agent_idx].goals_reached_this_episode += 1.0f;
+                }
+            } else if (env->goal_behavior == GOAL_STOP) {
+                if (env->entities[agent_idx].stopped != 1) {
+                    env->rewards[i] = env->reward_goal;
+                    env->logs[i].episode_return = env->reward_goal;
+                    env->entities[agent_idx].stopped = 1;
+                    env->entities[agent_idx].goals_reached_this_episode += 1.0f;
+                }
+
             } else { // Zero out the velocity so that the agent stops at the goal
-                env->rewards[i] = env->reward_goal;
-                env->logs[i].episode_return = env->reward_goal;
-                env->entities[agent_idx].stopped = 1;
-                env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
-                env->entities[agent_idx].goals_reached_this_episode += 1.0f;
+                printf("Unknown goal behavior.\n");
+                // printf("Something really goes wrong here, goal behavior of agent %d is %d.\n", agent_idx, env->goal_behavior);
+                // env->rewards[i] = env->reward_goal;
+                // env->logs[i].episode_return = env->reward_goal;
+                // env->entities[agent_idx].stopped = 1;
+                // env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
+                // env->entities[agent_idx].goals_reached_this_episode += 1.0f;
             }
+        
+            // stopped nur, wenn wirklich stopped
+            // respawn_timestep == -1 -> nochmal anderes if drumrum
+
             env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
             env->logs[i].speed_at_goal = current_speed;
         }
@@ -2177,53 +3073,53 @@ void c_step(Drive *env) {
         env->logs[i].lane_alignment_rate = lane_aligned;
     }
 
+    // reset agents if respawned, reset velocity or position if stopped/removed.
     if (env->goal_behavior == GOAL_RESPAWN) {
         for (int i = 0; i < env->active_agent_count; i++) {
             int agent_idx = env->active_agent_indices[i];
             int reached_goal = env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX];
             if (reached_goal) {
-                env->terminals[i] = 1;
                 respawn_agent(env, agent_idx);
                 env->entities[agent_idx].respawn_count++;
+                env->terminals[i] = 1; // terminated in this context, since it got respawned afterwards and values are not connected anymore!
             }
         }
-    } else if (env->goal_behavior == GOAL_STOP) {
+
+
+    } 
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        if (env->entities[agent_idx].stopped == 1){
+            env->terminals[i] = 1;
+            env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
+        } else if (env->entities[agent_idx].removed == 1){
+            env->terminals[i] = 1;
+            env->entities[agent_idx].x = env->entities[agent_idx].y = -10000.0f;           
+        }
+    }
+    // termination_mode==1: truncate scene in the step afterwards, if all agents either got respawned, removed or stopped
+    if (env->termination_mode == 1){
+        int all_agents_respawned_stopped_removed = 1;
         for (int i = 0; i < env->active_agent_count; i++) {
             int agent_idx = env->active_agent_indices[i];
-            int reached_goal = env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX];
-            if (reached_goal) {
-                env->entities[agent_idx].stopped = 1;
-                env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
+            if ((env->entities[agent_idx].respawn_count + env->entities[agent_idx].stopped + env->entities[agent_idx].removed) == 0) {
+                all_agents_respawned_stopped_removed = 0;
+                break;
+            }
+        }
+        for (int i = 0; i < env->active_agent_count; i++) {
+            if (all_agents_respawned_stopped_removed == 1) {
+                env->truncations[i] = 1;
+                //printf("I truncated, because everything respawned, stopped or removed at timestep %d\n", env->timestep);
             }
         }
     }
 
-    // Episode boundary after this step: treat time-limit and early-termination as truncation.
-    // `timestep` is incremented at step start, so truncate when `(timestep + 1) >= episode_length`.
-    int originals_remaining = 0;
-    for (int i = 0; i < env->active_agent_count; i++) {
-        int agent_idx = env->active_agent_indices[i];
-        if (env->entities[agent_idx].respawn_count == 0) {
-            originals_remaining = 1;
-            break;
-        }
-    }
-    int reached_time_limit = (env->timestep + 1) >= env->episode_length;
-    int reached_early_termination = (!originals_remaining && env->termination_mode == 1);
-    if (reached_time_limit || reached_early_termination) {
-        for (int i = 0; i < env->active_agent_count; i++) {
-            env->truncations[i] = 1;
-        }
-        add_log(env);
-        c_reset(env);
-        return;
-    }
 
     compute_observations(env);
 }
 
 typedef struct Client Client;
-
 struct Client {
     float width;
     float height;
@@ -2235,96 +3131,19 @@ struct Client {
     Model cyclist;
     Model pedestrian;
     ModelAnimation *cycle_anim;
-    int car_assignments[MAX_AGENTS];
+    int car_assignments[MAX_AGENTS]; // To keep car model assignments consistent per vehicle
     Vector3 default_camera_position;
     Vector3 default_camera_target;
-    int recorder_pipefd[2];
-    pid_t recorder_pid;
-    pid_t xvfb_pid;
-    int xvfb_display_num;
 };
 
 Client *make_client(Drive *env) {
-
     Client *client = (Client *)calloc(1, sizeof(Client));
-
-    if (env->render_mode == RENDER_HEADLESS && getenv("DISPLAY") == NULL) {
-
-        // Kill any existing Xvfb first
-        system("pkill -9 Xvfb");
-        usleep(200000);
-        unlink("/tmp/.X99-lock");
-        unlink("/tmp/.X11-unix/X99");
-
-        // Hardcode to single display because we only run this in one process at once
-        client->xvfb_display_num = 99;
-
-        // Clean up stale lock if process is dead
-        FILE *f = fopen("/tmp/.X99-lock", "r");
-        if (f) {
-            pid_t pid = -1;
-            fscanf(f, "%d", &pid);
-            fclose(f);
-            if (pid > 0 && kill(pid, 0) != 0)
-                unlink("/tmp/.X99-lock");
-        }
-
-        client->xvfb_pid = fork();
-        if (client->xvfb_pid == 0) {
-            close(STDOUT_FILENO);
-            close(STDERR_FILENO);
-            execlp("Xvfb", "Xvfb", ":99", "-screen", "0", "1280x720x24", "+extension", "GLX", "-ac", "-noreset", NULL);
-            _exit(1);
-        }
-
-        setenv("DISPLAY", ":99", 1);
-        // Xvfb starts asynchronously after fork(), so we poll until it creates its
-        // lock file (max 2s) then wait an extra 200ms for GLX to finish initializing.
-        // Without this, raylib's InitWindow() would try to connect before Xvfb is ready.
-        for (int i = 0; i < 20 && access("/tmp/.X99-lock", F_OK) != 0; i++)
-            usleep(100000);
-        usleep(200000);
-    }
-
-    if (env->render_mode == RENDER_WINDOW) {
-        client->width = 1280;
-        client->height = 704;
-        SetConfigFlags(FLAG_MSAA_4X_HINT);
-        SetTargetFPS(30);
-
-        // Set up camera for interactive window
-        Vector3 target_pos = {0, 0, 1}; // Y is up, Z is depth
-
-        client->default_camera_position = (Vector3){
-            0,      // Same X as target
-            120.0f, // 20 units above target
-            175.0f  // 20 units behind target
-        };
-        client->default_camera_target = target_pos;
-        client->camera.position = client->default_camera_position;
-        client->camera.target = client->default_camera_target;
-        client->camera.up = (Vector3){0.0f, -1.0f, 0.0f}; // Y is up
-        client->camera.fovy = 45.0f;
-        client->camera.projection = CAMERA_PERSPECTIVE;
-
-    } else { // Headless rendering
-        SetConfigFlags(FLAG_WINDOW_HIDDEN);
-        SetTargetFPS(6000);
-
-        float map_width = env->grid_map->bottom_right_x - env->grid_map->top_left_x;
-        float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
-        float scale = 6.0f; // Controls the resolution of the output video
-        int img_width = (int)roundf(map_width * scale / 2.0f) * 2;
-        int img_height = (int)roundf(map_height * scale / 2.0f) * 2;
-
-        client->width = img_width;
-        client->height = img_height;
-    }
-
-    SetTraceLogLevel(LOG_WARNING); // Only show warnings and errors
+    client->width = 1280;
+    client->height = 704;
+    SetConfigFlags(FLAG_MSAA_4X_HINT);
     InitWindow(client->width, client->height, "PufferDrive");
-
-    // Load assets
+    SetTargetFPS(30);
+    client->puffers = LoadTexture("resources/puffers_128.png");
     client->cars[0] = LoadModel("resources/drive/RedCar.glb");
     client->cars[1] = LoadModel("resources/drive/WhiteCar.glb");
     client->cars[2] = LoadModel("resources/drive/BlueCar.glb");
@@ -2338,43 +3157,26 @@ Client *make_client(Drive *env) {
     for (int i = 0; i < MAX_AGENTS; i++) {
         client->car_assignments[i] = (rand() % 4) + 1;
     }
+    // Get initial target position from first active agent
+    Vector3 target_pos = {
+        0,
+        0, // Y is up
+        1  // Z is depth
+    };
 
-    // Set up ffmpeg process for recording
-    if (env->render_mode == RENDER_HEADLESS) {
-        if (pipe(client->recorder_pipefd) == -1) {
-            fprintf(stderr, "Failed to create pipe\n");
-            free(client);
-            return NULL;
-        }
-
-        char size_str[64];
-        snprintf(size_str, sizeof(size_str), "%dx%d", (int)client->width, (int)client->height);
-
-        char filename[256];
-        snprintf(filename, sizeof(filename), "%s.mp4", env->scenario_id);
-
-        client->recorder_pid = fork();
-        if (client->recorder_pid == -1) {
-            fprintf(stderr, "Failed to fork\n");
-            free(client);
-            return NULL;
-        }
-
-        if (client->recorder_pid == 0) { // Child process
-            close(client->recorder_pipefd[1]);
-            dup2(client->recorder_pipefd[0], STDIN_FILENO);
-            close(client->recorder_pipefd[0]);
-            for (int fd = 3; fd < 256; fd++)
-                close(fd);
-            execlp("ffmpeg", "ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", size_str, "-r", "30", "-i",
-                   "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-crf", "23", "-loglevel",
-                   "error", filename, NULL);
-            fprintf(stderr, "execlp ffmpeg failed\n");
-            _exit(1);
-        }
-        close(client->recorder_pipefd[0]);
-    }
-
+    // Set up camera to look at target from above and behind
+    client->default_camera_position = (Vector3){
+        0,      // Same X as target
+        120.0f, // 20 units above target
+        175.0f  // 20 units behind target
+    };
+    client->default_camera_target = target_pos;
+    client->camera.position = client->default_camera_position;
+    client->camera.target = client->default_camera_target;
+    client->camera.up = (Vector3){0.0f, -1.0f, 0.0f}; // Y is up
+    client->camera.fovy = 45.0f;
+    client->camera.projection = CAMERA_PERSPECTIVE;
+    client->camera_zoom = 1.0f;
     return client;
 }
 
@@ -2476,27 +3278,18 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
     // draw goal
     float goal_x = agent_obs[0] * 200;
     float goal_y = agent_obs[1] * 200;
-
-    int agent_type = env->entities[active_idx].type;
-    Color goal_color = LIGHTBLUE;
-    if (agent_type == PEDESTRIAN)
-        goal_color = LIGHT_ORANGE;
-    else if (agent_type == CYCLIST)
-        goal_color = LIGHT_PURPLE;
-
-    if (mode == 0) { // agent-relative coordinates
-        DrawSphere((Vector3){goal_x, goal_y, Z_AGENT_DETAILS}, 0.5f, goal_color);
-        DrawCircle3D((Vector3){goal_x, goal_y, Z_AGENT_DETAILS}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f,
-                     Fade(goal_color, 0.3f));
+    if (mode == 0) {
+        DrawSphere((Vector3){goal_x, goal_y, 1}, 0.5f, LIGHTGREEN);
+        DrawCircle3D((Vector3){goal_x, goal_y, 0.1f}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f,
+                     Fade(LIGHTGREEN, 0.3f));
     }
 
-    if (mode == 1) { // world coordinates
-
+    if (mode == 1) {
         float goal_x_world = px + (goal_x * heading_self_x - goal_y * heading_self_y);
         float goal_y_world = py + (goal_x * heading_self_y + goal_y * heading_self_x);
-        DrawSphere((Vector3){goal_x_world, goal_y_world, Z_AGENT_DETAILS}, 0.5f, goal_color);
-        DrawCircle3D((Vector3){goal_x_world, goal_y_world, Z_AGENT_DETAILS}, env->goal_radius, (Vector3){0, 0, 1},
-                     90.0f, Fade(goal_color, 0.3f));
+        DrawSphere((Vector3){goal_x_world, goal_y_world, 1}, 0.5f, LIGHTGREEN);
+        DrawCircle3D((Vector3){goal_x_world, goal_y_world, 0.1f}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f,
+                     Fade(LIGHTGREEN, 0.3f));
     }
     // First draw other agent observations
     int obs_idx = ego_dim; // Start after ego obs
@@ -2509,13 +3302,13 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         float x = agent_obs[obs_idx] * 50;
         float y = agent_obs[obs_idx + 1] * 50;
         if (lasers && mode == 0) {
-            DrawLine3D((Vector3){0, 0, 0}, (Vector3){x, y, Z_AGENT_DETAILS}, ORANGE);
+            DrawLine3D((Vector3){0, 0, 0}, (Vector3){x, y, 1}, ORANGE);
         }
 
         float partner_x = px + (x * heading_self_x - y * heading_self_y);
         float partner_y = py + (x * heading_self_y + y * heading_self_x);
         if (lasers && mode == 1) {
-            DrawLine3D((Vector3){px, py, Z_AGENT_DETAILS}, (Vector3){partner_x, partner_y, Z_AGENT_DETAILS}, ORANGE);
+            DrawLine3D((Vector3){px, py, 1}, (Vector3){partner_x, partner_y, 1}, ORANGE);
         }
 
         float half_width = 0.5 * agent_obs[obs_idx + 2] * MAX_VEH_WIDTH;
@@ -2527,13 +3320,13 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         float sin_heading = sinf(partner_angle);
         Vector3 corners[4] = {
             (Vector3){x + (half_len * cos_heading - half_width * sin_heading),
-                      y + (half_len * sin_heading + half_width * cos_heading), Z_AGENT_DETAILS},
+                      y + (half_len * sin_heading + half_width * cos_heading), 1},
             (Vector3){x + (half_len * cos_heading + half_width * sin_heading),
-                      y + (half_len * sin_heading - half_width * cos_heading), Z_AGENT_DETAILS},
+                      y + (half_len * sin_heading - half_width * cos_heading), 1},
             (Vector3){x + (-half_len * cos_heading + half_width * sin_heading),
-                      y + (-half_len * sin_heading - half_width * cos_heading), Z_AGENT_DETAILS},
+                      y + (-half_len * sin_heading - half_width * cos_heading), 1},
             (Vector3){x + (-half_len * cos_heading - half_width * sin_heading),
-                      y + (-half_len * sin_heading + half_width * cos_heading), Z_AGENT_DETAILS},
+                      y + (-half_len * sin_heading + half_width * cos_heading), 1},
         };
 
         if (mode == 0) {
@@ -2564,13 +3357,12 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         float arrow_x_world;
         float arrow_y_world;
         if (mode == 0) {
-            DrawLine3D((Vector3){x, y, Z_AGENT_DETAILS}, (Vector3){arrow_x, arrow_y, Z_AGENT_DETAILS}, PUFF_WHITE);
+            DrawLine3D((Vector3){x, y, 0.0}, (Vector3){arrow_x, arrow_y, 0.0}, PUFF_WHITE);
         }
         if (mode == 1) {
             arrow_x_world = px + (arrow_x * heading_self_x - arrow_y * heading_self_y);
             arrow_y_world = py + (arrow_x * heading_self_y + arrow_y * heading_self_x);
-            DrawLine3D((Vector3){partner_x, partner_y, Z_AGENT_DETAILS},
-                       (Vector3){arrow_x_world, arrow_y_world, Z_AGENT_DETAILS}, PUFF_WHITE);
+            DrawLine3D((Vector3){partner_x, partner_y, 1}, (Vector3){arrow_x_world, arrow_y_world, 1}, PUFF_WHITE);
         }
         // Calculate perpendicular offsets for arrow head
         float arrow_size = 0.3f; // Size of the arrow head
@@ -2744,29 +3536,20 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                     break;
                 }
             }
-
-            for (int j = 0; j < env->expert_static_agent_count; j++) {
-                if (env->expert_static_agent_indices[j] == i) {
-                    is_static_agent = true;
-                    break;
-                }
-            }
-
             for (int j = 0; j < env->static_agent_count; j++) {
                 if (env->static_agent_indices[j] == i) {
                     is_static_agent = true;
                     break;
                 }
             }
-
+            // HIDE CARS ON RESPAWN - IMPORTANT TO KNOW VISUAL SETTING
             if ((!is_active_agent && !is_static_agent) || env->entities[i].respawn_timestep != -1) {
                 continue;
             }
             Vector3 position;
             float heading;
-            position = (Vector3){env->entities[i].x, env->entities[i].y, Z_AGENTS};
+            position = (Vector3){env->entities[i].x, env->entities[i].y, 1.1};
             heading = env->entities[i].heading;
-
             // Create size vector
             Vector3 size = {env->entities[i].length, env->entities[i].width, env->entities[i].height};
 
@@ -2803,39 +3586,25 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                     continue;
                 }
 
-                // Draw the agent bounding boxes
-                Color agent_color = GRAY;
-                if (is_expert) {
-                    if (env->entities[i].type == PEDESTRIAN || env->entities[i].type == CYCLIST)
-                        agent_color = EXPERT_REPLAY_SMALL;
-                    else
-                        agent_color = EXPERT_REPLAY;
-                }
-                if (is_active_agent) {
-                    if (env->entities[i].type == PEDESTRIAN)
-                        agent_color = LIGHT_ORANGE;
-                    else if (env->entities[i].type == CYCLIST)
-                        agent_color = LIGHT_PURPLE;
-                    else
-                        agent_color = BLUE;
-                }
+                // --- Draw the car  ---
+                Color car_color = GRAY; // default for static
+                if (is_expert)
+                    car_color = GOLD; // expert replay
+                if (is_active_agent)
+                    car_color = BLUE; // policy-controlled
                 if (is_active_agent && env->entities[i].collision_state > 0)
-                    agent_color = RED;
-
-                rlPushMatrix();
-                rlTranslatef(position.x, position.y, position.z);
-                rlRotatef(heading * RAD2DEG, 0.0f, 0.0f, 1.0f);
-                DrawCube((Vector3){0.0f, 0.0f, 0.0f}, size.x, size.y, 1.0f, Fade(agent_color, 0.5f));
-                DrawCubeWires((Vector3){0.0f, 0.0f, 0.0f}, size.x, size.y, 1.0f, agent_color);
-                rlPopMatrix();
-
-                // Draw a heading arrow pointing forward
+                    car_color = RED;
+                rlSetLineWidth(3.0f);
+                for (int j = 0; j < 4; j++) {
+                    DrawLine3D(corners[j], corners[(j + 1) % 4], car_color);
+                }
+                // --- Draw a heading arrow pointing forward ---
                 Vector3 arrowStart = position;
                 Vector3 arrowEnd = {position.x + cos_heading * half_len * 1.5f, // extend arrow beyond car
                                     position.y + sin_heading * half_len * 1.5f, position.z};
 
-                DrawLine3D(arrowStart, arrowEnd, agent_color);
-                DrawSphere(arrowEnd, 0.2f, agent_color); // arrow tip
+                DrawLine3D(arrowStart, arrowEnd, car_color);
+                DrawSphere(arrowEnd, 0.2f, car_color); // arrow tip
 
             } else { // Agent view
                 rlPushMatrix();
@@ -2869,7 +3638,10 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 Vector3 model_size = {bounds.max.x - bounds.min.x, bounds.max.y - bounds.min.y,
                                       bounds.max.z - bounds.min.z};
                 Vector3 scale = {size.x / model_size.x, size.y / model_size.y, size.z / model_size.z};
-
+                // if((obs_only ||  IsKeyDown(KEY_LEFT_CONTROL)) && agent_index != env->human_agent_idx){
+                //     rlPopMatrix();
+                //     continue;
+                // }
                 if (env->entities[i].type == CYCLIST) {
                     scale = (Vector3){0.01, 0.01, 0.01};
                     car_model = client->cyclist;
@@ -2888,11 +3660,11 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                         (Vector3){-half_len, half_width, 0},  // Back-right
                         (Vector3){-half_len, -half_width, 0}, // Back-left
                     };
-                    Color wire_color = GRAY;
+                    Color wire_color = GRAY; // static
                     if (!is_active_agent && env->entities[i].mark_as_expert == 1)
-                        wire_color = EXPERT_REPLAY;
+                        wire_color = GOLD; // expert replay
                     if (is_active_agent)
-                        wire_color = BLUE; // Policy-controlled
+                        wire_color = BLUE; // policy
                     if (is_active_agent && env->entities[i].collision_state > 0)
                         wire_color = RED;
                     rlSetLineWidth(2.0f);
@@ -2924,18 +3696,11 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 continue;
             }
             if (!IsKeyDown(KEY_LEFT_CONTROL) && obs_only == 0) {
-                Color goal_color = DEEPBLUE;
-                if (env->entities[i].type == PEDESTRIAN)
-                    goal_color = LIGHT_ORANGE;
-                else if (env->entities[i].type == CYCLIST)
-                    goal_color = LIGHT_PURPLE;
+                DrawSphere((Vector3){env->entities[i].goal_position_x, env->entities[i].goal_position_y, 1}, 0.5f,
+                           DARKGREEN);
 
-                DrawSphere(
-                    (Vector3){env->entities[i].goal_position_x, env->entities[i].goal_position_y, Z_AGENT_DETAILS},
-                    0.5f, goal_color);
-                DrawCircle3D(
-                    (Vector3){env->entities[i].goal_position_x, env->entities[i].goal_position_y, Z_AGENT_DETAILS},
-                    env->goal_radius, (Vector3){0, 0, Z_AGENT_DETAILS}, 90.0f, Fade(goal_color, 0.9f));
+                DrawCircle3D((Vector3){env->entities[i].goal_position_x, env->entities[i].goal_position_y, 0.1f},
+                             env->goal_radius, (Vector3){0, 0, 1}, 90.0f, Fade(LIGHTGREEN, 0.9f));
             }
         }
         // Draw road elements
@@ -2943,15 +3708,15 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
             continue;
         }
         for (int j = 0; j < env->entities[i].array_size - 1; j++) {
-            Vector3 start = {env->entities[i].traj_x[j], env->entities[i].traj_y[j], Z_ROAD_MARKINGS};
-            Vector3 end = {env->entities[i].traj_x[j + 1], env->entities[i].traj_y[j + 1], Z_ROAD_MARKINGS};
+            Vector3 start = {env->entities[i].traj_x[j], env->entities[i].traj_y[j], 1};
+            Vector3 end = {env->entities[i].traj_x[j + 1], env->entities[i].traj_y[j + 1], 1};
             Color lineColor = GRAY;
             if (env->entities[i].type == ROAD_LANE)
                 lineColor = Fade(SOFT_YELLOW, 0.25f);
             else if (env->entities[i].type == ROAD_LINE)
                 lineColor = WHITE;
             else if (env->entities[i].type == ROAD_EDGE)
-                lineColor = Fade(WHITE, 0.7f);
+                lineColor = WHITE;
             else if (env->entities[i].type == DRIVEWAY)
                 lineColor = RED;
 
@@ -2998,191 +3763,96 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
     }
 }
 
-void c_render(Drive *env, int view_mode, int draw_traces) {
-
-    // Create client on first render call
+void c_render(Drive *env) {
     if (env->client == NULL) {
         env->client = make_client(env);
     }
-
     Client *client = env->client;
+    BeginDrawing();
+    Color road = (Color){35, 35, 37, 255};
+    ClearBackground(road);
+    BeginMode3D(client->camera);
+    handle_camera_controls(env->client);
+    draw_scene(env, client, 0, 0, 0, 0);
 
-    if (env->render_mode == RENDER_HEADLESS) { // Headless rendering via ffmpeg
-        float map_width = env->grid_map->bottom_right_x - env->grid_map->top_left_x;
-        float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
-
-        Camera3D camera = {0};
-
-        if (view_mode == VIEW_MODE_SIM_STATE) {
-            // Orthographic bird's-eye view over the entire map (fully observable)
-            camera.position = (Vector3){0.0, 0.0, 400.0f}; // Above the scene
-            camera.target = (Vector3){0.0, 0.0, 0.0};      // Look at origin
-            camera.up = (Vector3){0.0f, -1.0f, 0.0f};
-            camera.projection = CAMERA_ORTHOGRAPHIC;
-            camera.fovy = map_height;
-
-            BeginDrawing();
-            ClearBackground(ROAD_COLOR);
-            BeginMode3D(camera);
-
-            if (draw_traces) { // Show logged trajectories of active agents and expert static agents
-                for (int i = 0; i < env->active_agent_count; i++) {
-                    int idx = env->active_agent_indices[i];
-                    for (int t = env->init_steps; t < env->episode_length; t++) {
-                        Color agent_color = LIGHTBLUE;
-                        if (env->entities[idx].type == PEDESTRIAN) {
-                            agent_color = LIGHT_ORANGE;
-                        } else if (env->entities[idx].type == CYCLIST) {
-                            agent_color = LIGHT_PURPLE;
-                        }
-                        DrawSphere(
-                            (Vector3){env->entities[idx].traj_x[t], env->entities[idx].traj_y[t], Z_AGENT_DETAILS},
-                            0.15f, agent_color);
-                    }
-                }
-
-                for (int i = 0; i < env->expert_static_agent_count; i++) {
-                    int idx = env->expert_static_agent_indices[i];
-                    for (int t = env->init_steps; t < env->episode_length; t++) {
-                        DrawSphere(
-                            (Vector3){env->entities[idx].traj_x[t], env->entities[idx].traj_y[t], Z_AGENT_DETAILS},
-                            0.15f, EXPERT_REPLAY);
-                    }
-                }
-            }
-
-            draw_scene(env, client, 1, 0, 0, 0);
-
-        } else if (view_mode == VIEW_MODE_BEV_AGENT_OBS) {
-            // Orthographic bird's-eye view centered on the selected agent,
-            // showing only that agent's observations
-            int agent_idx = env->active_agent_indices[env->human_agent_idx];
-            Entity *agent = &env->entities[agent_idx];
-
-            Camera3D camera = {0};
-            camera.position = (Vector3){agent->x, agent->y, 400.0f};
-            camera.target = (Vector3){agent->x, agent->y, 0.0f};
-            camera.up = (Vector3){0.0f, -1.0f, 0.0f};
-            camera.projection = CAMERA_ORTHOGRAPHIC;
-            camera.fovy = env->grid_map->vision_range * GRID_CELL_SIZE * 2.0f;
-
-            BeginDrawing();
-            ClearBackground(ROAD_COLOR);
-            BeginMode3D(camera);
-            draw_scene(env, client, 1, 1, 0, 0);
-
-        } else { // First-person perspective from a selected agent
-            int agent_idx = env->active_agent_indices[env->human_agent_idx];
-            Entity *agent = &env->entities[agent_idx];
-
-            Camera3D camera = {0};
-            // Position camera behind and above the agent
-            camera.position =
-                (Vector3){agent->x - (25.0f * cosf(agent->heading)), agent->y - (25.0f * sinf(agent->heading)), 15.0f};
-            camera.target =
-                (Vector3){agent->x + 40.0f * cosf(agent->heading), agent->y + 40.0f * sinf(agent->heading), 1.0f};
-            camera.up = (Vector3){0.0f, 0.0f, 1.0f};
-            camera.fovy = 60.0f;
-            camera.projection = CAMERA_PERSPECTIVE;
-
-            BeginDrawing();
-            ClearBackground(ROAD_COLOR);
-            BeginMode3D(camera);
-            draw_scene(env, client, 0, 0, 0, 1);
-        }
-
-        EndDrawing();
-
-        unsigned char *screen_data = rlReadScreenPixels((int)client->width, (int)client->height);
-        if (screen_data) {
-            write(client->recorder_pipefd[1], screen_data, (int)client->width * (int)client->height * 4);
-            RL_FREE(screen_data);
-        }
-    } else { // Pop-up window
-        BeginDrawing();
-        ClearBackground(ROAD_COLOR);
-        BeginMode3D(client->camera);
-        handle_camera_controls(env->client);
-        draw_scene(env, client, 0, 0, 0, 0);
-
-        if (IsKeyPressed(KEY_TAB) && env->active_agent_count > 0) {
-            env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
-        }
-
-        DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
-        DrawText(TextFormat("Controlling agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
-        int human_idx = env->active_agent_indices[env->human_agent_idx];
-
-        Color action_color = IsKeyDown(KEY_LEFT_SHIFT) ? YELLOW : PUFF_WHITE;
-
-        if (env->action_type == 0) { // discrete
-            int *action_array = (int *)env->actions;
-            int action_val = action_array[env->human_agent_idx];
-
-            if (env->dynamics_model == CLASSIC) {
-                int num_steer = 13;
-                int accel_idx = action_val / num_steer;
-                int steer_idx = action_val % num_steer;
-                float accel_value = ACCELERATION_VALUES[accel_idx];
-                float steer_value = STEERING_VALUES[steer_idx];
-
-                DrawText(TextFormat("Acceleration: %.2f m/s^2", accel_value), 10, 110, 20, action_color);
-                DrawText(TextFormat("Steering: %.3f", steer_value), 10, 130, 20, action_color);
-            } else if (env->dynamics_model == JERK) {
-                int num_lat = 3;
-                int jerk_long_idx = action_val / num_lat;
-                int jerk_lat_idx = action_val % num_lat;
-                float jerk_long_value = JERK_LONG[jerk_long_idx];
-                float jerk_lat_value = JERK_LAT[jerk_lat_idx];
-
-                DrawText(TextFormat("Longitudinal Jerk: %.2f m/s^3", jerk_long_value), 10, 110, 20, action_color);
-                DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, 130, 20, action_color);
-            }
-        } else { // continuous
-            float (*action_array_f)[2] = (float (*)[2])env->actions;
-            DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
-                     action_color);
-            DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20, action_color);
-        }
-
-        int status_y = 150;
-        if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            DrawText("[shift pressed]", 10, status_y, 20, YELLOW);
-            status_y += 20;
-        }
-        if (IsKeyDown(KEY_SPACE)) {
-            DrawText("[space pressed]", 10, status_y, 20, YELLOW);
-            status_y += 20;
-        }
-        if (IsKeyDown(KEY_LEFT_CONTROL)) {
-            DrawText("[ctrl pressed]", 10, status_y, 20, YELLOW);
-            status_y += 20;
-        }
-
-        DrawText("Controls: SHIFT + W/S - Accelerate/Brake, SHIFT + A/D - Steer, TAB - Switch Agent", 10,
-                 client->height - 30, 20, PUFF_WHITE);
-        DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
-        DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
-        EndDrawing();
+    if (IsKeyPressed(KEY_TAB)) {
+        env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
     }
+
+    // Draw debug info
+    DrawText(TextFormat("Camera Position: (%.2f, %.2f, %.2f)", client->camera.position.x, client->camera.position.y,
+                        client->camera.position.z),
+             10, 10, 20, PUFF_WHITE);
+    DrawText(TextFormat("Camera Target: (%.2f, %.2f, %.2f)", client->camera.target.x, client->camera.target.y,
+                        client->camera.target.z),
+             10, 30, 20, PUFF_WHITE);
+    DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
+
+    int human_idx = env->active_agent_indices[env->human_agent_idx];
+    DrawText(TextFormat("Controlling Agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
+    DrawText(TextFormat("Agent Index: %d", human_idx), 10, 90, 20, PUFF_WHITE);
+
+    // Display current action values - yellow when controlling, white otherwise
+    Color action_color = IsKeyDown(KEY_LEFT_SHIFT) ? YELLOW : PUFF_WHITE;
+
+    if (env->action_type == 0) { // discrete
+        int *action_array = (int *)env->actions;
+        int action_val = action_array[env->human_agent_idx];
+
+        if (env->dynamics_model == CLASSIC) {
+            int num_steer = 13;
+            int accel_idx = action_val / num_steer;
+            int steer_idx = action_val % num_steer;
+            float accel_value = ACCELERATION_VALUES[accel_idx];
+            float steer_value = STEERING_VALUES[steer_idx];
+
+            DrawText(TextFormat("Acceleration: %.2f m/s^2", accel_value), 10, 110, 20, action_color);
+            DrawText(TextFormat("Steering: %.3f", steer_value), 10, 130, 20, action_color);
+        } else if (env->dynamics_model == JERK) {
+            int num_lat = 3;
+            int jerk_long_idx = action_val / num_lat;
+            int jerk_lat_idx = action_val % num_lat;
+            float jerk_long_value = JERK_LONG[jerk_long_idx];
+            float jerk_lat_value = JERK_LAT[jerk_lat_idx];
+
+            DrawText(TextFormat("Longitudinal Jerk: %.2f m/s^3", jerk_long_value), 10, 110, 20, action_color);
+            DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, 130, 20, action_color);
+        }
+    } else { // continuous
+        float (*action_array_f)[2] = (float (*)[2])env->actions;
+        DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20, action_color);
+        DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20, action_color);
+    }
+
+    // Show key press status
+    int status_y = 150;
+    if (IsKeyDown(KEY_LEFT_SHIFT)) {
+        DrawText("[shift pressed]", 10, status_y, 20, YELLOW);
+        status_y += 20;
+    }
+    if (IsKeyDown(KEY_SPACE)) {
+        DrawText("[space pressed]", 10, status_y, 20, YELLOW);
+        status_y += 20;
+    }
+    if (IsKeyDown(KEY_LEFT_CONTROL)) {
+        DrawText("[ctrl pressed]", 10, status_y, 20, YELLOW);
+        status_y += 20;
+    }
+
+    // Controls help
+    DrawText("Controls: SHIFT + W/S - Accelerate/Brake, SHIFT + A/D - Steer, TAB - Switch Agent", 10,
+             client->height - 30, 20, PUFF_WHITE);
+
+    DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
+    DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
+    EndDrawing();
 }
 
 void close_client(Client *client) {
-    if (client->recorder_pid > 0) {
-        close(client->recorder_pipefd[1]);
-        waitpid(client->recorder_pid, NULL, 0);
-    }
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 6; i++) {
         UnloadModel(client->cars[i]);
-    UnloadModel(client->cyclist);
-    UnloadModel(client->pedestrian);
-    CloseWindow();
-    if (client->xvfb_pid > 0) {
-        kill(client->xvfb_pid, SIGTERM);
-        waitpid(client->xvfb_pid, NULL, 0);
-        unlink("/tmp/.X99-lock");
-        unsetenv("DISPLAY");
     }
-
+    UnloadTexture(client->puffers);
+    CloseWindow();
     free(client);
 }

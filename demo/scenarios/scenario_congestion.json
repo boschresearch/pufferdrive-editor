@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "meta": {
+    "selected_split": "testing",
+    "selected_map": 26,
+    "selected_map_path": "",
+    "map_id_input": "26",
+    "sim_steps": 91,
+    "selected_policy_path": "pufferlib/resources/drive/model_puffer_drive_003815.pt",
+    "selected_policy_config": "",
+    "ghost_policy_path": "pufferlib/resources/drive/model_puffer_drive_003815.pt",
+    "ghost_policy_config": ""
+  },
+  "flags": {
+    "ghost_env_active": false,
+    "ghost_side_by_side": false,
+    "mirror_placement": false,
+    "env_focus": "primary",
+    "ghost_diverge_frame": 0,
+    "agent_size": "M",
+    "static_size": "M",
+    "expert_size": "M",
+    "show_goals": true,
+    "show_goal_radius": true,
+    "show_labels": true,
+    "show_trajectories": true
+  },
+  "_desc": "Congestion: 13 of 18 native agents are all retargeted to converge on a single on-road point ~(2514,-71), funnelling the whole crowd through one spot so they must queue, yield and thread past each other.",
+  "primary": {
+    "user_agents": [],
+    "user_static_agents": [],
+    "user_expert_agents": [],
+    "goal_overrides": {
+      "1": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "2": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "4": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "5": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "6": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "8": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "9": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "10": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "12": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "14": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "15": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "16": [
+        2513.916015625,
+        -71.4234390258789
+      ],
+      "17": [
+        2513.916015625,
+        -71.4234390258789
+      ]
+    },
+    "removed_slots": [],
+    "removed_static_slots": [],
+    "removed_native_expert_idxs": [],
+    "pending_static_detach_slots": [],
+    "pending_expert_detach_idxs": [],
+    "env_has_detaches": false,
+    "native_active_moves": {},
+    "native_static_moves": {},
+    "native_expert_moves": {}
+  },
+  "ghost": {
+    "user_agents": [],
+    "user_static_agents": [],
+    "user_expert_agents": [],
+    "goal_overrides": {},
+    "removed_slots": [],
+    "removed_static_slots": [],
+    "removed_native_expert_idxs": [],
+    "native_active_moves": {},
+    "native_static_moves": {},
+    "native_expert_moves": {}
+  }
+}
