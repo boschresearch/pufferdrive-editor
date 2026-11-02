@@ -1,5 +1,65 @@
 # PufferDrive
 
+## Scene editor
+
+![PufferDrive scene editor](demo/assets/screenshot.png)
+
+This repository proposes a new **interactive scene editor** for running and testing scenes in
+PufferDrive. It is a browser app (built with [Reflex](https://reflex.dev), in [`demo/`](demo/))
+that loads a map binary, rolls out a trained policy in the simulator, and lets you edit the
+scene — move agents, retarget goals, add or delete controlled and parked vehicles, draw expert
+trajectories — then re-simulate and scrub through the result. A second "ghost" environment can
+run a different policy on the same scene for side-by-side comparison, and any edited scene can be
+saved to JSON and reloaded later. Unlike the existing [WOMD scenario editor](docs/src/scene-editor.md),
+which only edits scenario JSON, this editor runs the actual PufferDrive simulator and policies.
+
+### Highlights
+
+- **Scenario and track editor** — author stress tests on real maps by moving or inserting parked
+  obstacles and placing controlled vehicles with custom poses, goals, and expert trajectories
+  (e.g. narrow corridors, slaloms, emergency braking).
+- **Closed-loop re-simulation** — every edit is rolled out with a trained policy in the
+  PufferDrive simulator, so you see how the policy actually reacts.
+- **Real-time kinematics dashboard** — plots the realized acceleration and jerk of the selected
+  vehicle at every step against the passenger-comfort limits, with exceedances highlighted in red.
+- **Multi-model auditing** — run a second "ghost" policy on the same scene and compare the two
+  rollouts side by side or overlaid on one map, with synchronized timelines.
+- **Shareable scenes** — save edited scenes to JSON and reload them later or on another
+  machine.
+
+### Quick start
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e .
+uv pip install -r demo/requirements.txt
+export DRIVE_BINARIES_DATA_ROOT=/path/to/binaries   # contains training/ validation/ testing/
+cd demo && ./run.sh
+```
+
+Then open <http://localhost:3000>. `run.sh` builds the C extension, links in
+`pufferlib/resources`, and launches the app. If `DRIVE_BINARIES_DATA_ROOT` is unset, the binaries
+bundled in `pufferlib/resources/drive/binaries` are used.
+
+### How to use
+
+- **Header** — pick a Config profile, a Map, and a Policy, then hit **Load**. The second policy
+  dropdown drives the ghost environment.
+- **Toolbar** — `Pan`, `Select`, `Move`, `Goals`, `Agent` (add a controlled agent), `Static` (add
+  a parked vehicle). `Both` applies edits to the primary and ghost environment at once.
+- **Timeline** — scrub, play/pause, and loop the rollout to see how the policy reacts to your edits.
+- **Save scenes** — the export dialog writes the edited scene to `demo/scenarios/<name>.json`;
+  saved scenes reappear in the Map dropdown marked with ★. Example scenarios (bottleneck,
+  congestion, dead end, distractor, T-bone) are shipped in [`demo/scenarios/`](demo/scenarios/)
+  and need a `DRIVE_BINARIES_DATA_ROOT` with a populated `testing/` split.
+- **Configure** — the maps and policies on offer come from profile inis in `demo/config/`; copy
+  [`demo/config/example.ini`](demo/config/example.ini) to add your own checkpoints.
+
+See [demo/README.md](demo/README.md) for environment variables, the profile format, remote access
+over an SSH tunnel, and troubleshooting.
+
+---
+
 <img align="left" style="width:260px" src="https://github.com/Emerge-Lab/PufferDrive/blob/main/pufferlib/resources/drive/pufferdrive_20fps_long.gif" width="288px">
 
 **PufferDrive is a fast and friendly driving simulator to train and test RL-based models.**
@@ -17,15 +77,10 @@
 
 ---
 
+
 **Docs**: https://emerge-lab.github.io/PufferDrive
 
 ---
-
-### See our 2.0 release video
-
-<a href="https://www.youtube.com/watch?v=LfQ324R-cbE">
-  <img src="https://img.youtube.com/vi/LfQ324R-cbE/0.jpg" alt="PufferDrive 2.0" width="300">
-</a>
 
 ## Installation
 
@@ -160,34 +215,8 @@ The `-s` flag sets up a virtual screen at 1280x720 resolution with 24-bit color 
 
 ## Interactive demo
 
-<details>
-<summary>Browser-based scenario viewer and editor</summary>
-
-`demo/` contains a browser-based demo built with [Reflex](https://reflex.dev). It loads a map
-binary, rolls out a trained policy, and lets you edit the scene — move agents, retarget goals,
-add or remove vehicles, draw expert trajectories — then re-simulate and scrub through the
-result. A second "ghost" environment can run a different policy on the same scene for
-side-by-side comparison, and any edited scene can be saved to JSON and reloaded later.
-
-Quick start, from an activated virtual environment with the package installed:
-
-```bash
-pip install -r demo/requirements.txt
-export DRIVE_BINARIES_DATA_ROOT=/path/to/your/binaries
-cd demo && ./run.sh
-```
-
-Then open http://localhost:3000. `run.sh` builds the C extension, links in
-`pufferlib/resources`, and launches the app.
-
-Which maps and policies the demo offers is set by a profile ini in `demo/config/`
-(see `demo/config/example.ini`).
-
-See [demo/README.md](demo/README.md) for the full setup, the environment variables
-(`DRIVE_BINARIES_DATA_ROOT`, `DRIVE_CONFIG_DIR`, `DRIVE_SCENARIOS_DIR`, `HOST_IP`), the
-profile format, remote access over an SSH tunnel, and troubleshooting.
-
-</details>
+The browser-based scene editor lives in `demo/`. See [Scene editor](#scene-editor) at the top
+of this README for a quick start, and [demo/README.md](demo/README.md) for the full setup.
 
 ## Benchmarks
 
